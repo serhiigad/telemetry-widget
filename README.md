@@ -39,11 +39,16 @@
 
 ## Скриншоты
 
-| Полный режим | Компактный режим |
-|:---:|:---:|
-| <img src="screenshots/widget-full.png" width="300" alt="Полный режим виджета"> | <img src="screenshots/widget-compact.png" width="300" alt="Компактный режим виджета"> |
-| **История, прогноз и расход по дням** | **Настройки** |
-| <img src="screenshots/history.png" width="390" alt="История заряда, прогноз и расход по дням"> | <img src="screenshots/settings.png" width="390" alt="Окно настроек"> |
+<table>
+  <tr>
+    <td align="center"><img src="screenshots/widget-full.png" width="300" alt="Полный режим виджета"><br><sub>Полный режим</sub></td>
+    <td align="center"><img src="screenshots/widget-compact.png" width="300" alt="Компактный режим виджета"><br><sub>Компактный режим</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="screenshots/history.png" width="390" alt="История заряда, прогноз и расход по дням"><br><sub>История, прогноз и расход по дням</sub></td>
+    <td align="center"><img src="screenshots/settings.png" width="390" alt="Окно настроек"><br><sub>Настройки</sub></td>
+  </tr>
+</table>
 
 > На скриншотах — синтетические демонстрационные данные. Реальные имена
 > устройств, позиция окна и статистика в репозиторий не попадают.
