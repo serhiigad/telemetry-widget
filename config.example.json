@@ -8,6 +8,7 @@
   "refresh_sec": 2.0,
   "accent": "#E31937",
   "auto_accent": true,
+  "status_color": "",
   "pos": null,
   "hide_offline": false,
   "ignore": [],

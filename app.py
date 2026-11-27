@@ -61,6 +61,7 @@ DEFAULT_CONFIG = {
     "refresh_sec": 2.0,
     "accent": "#E31937",
     "auto_accent": True,     # плавно уводить акцент в красный при нагреве/нагрузке
+    "status_color": "",      # цвет статусных подписей (пусто = как «accent»)
     "pos": None,
     "hide_offline": False,
     "ignore": [],            # игнорируемые устройства (системные имена)
@@ -1584,6 +1585,14 @@ class Widget(QWidget):
             f" border-radius: {radius:.0f}px; }}"
         )
 
+    def _status_color(self):
+        """Цвет статусных подписей: процент при низком заряде, горячая
+        температура. Пусто в настройках — берём акцент (цвет полос)."""
+        color = QColor(str(self.cfg.get("status_color") or "").strip())
+        if color.isValid():
+            return color
+        return QColor(self._accent_now)
+
     def _apply_accent_color(self, color):
         """Перекрасить полоски, «горячие» подписи и 📌 текущим акцентом."""
         self._accent_now = QColor(color)
@@ -1592,10 +1601,11 @@ class Widget(QWidget):
                 self._restyle_bar(bar, radius)
             except RuntimeError:                 # полоска уже удалена
                 pass
+        status = self._status_color().name()
         for lbl in list(getattr(self, "_accent_labels", [])):
             try:
                 lbl.setStyleSheet(
-                    f"color: {self._accent_now.name()}; background: transparent;")
+                    f"color: {status}; background: transparent;")
             except RuntimeError:
                 pass
         pin = getattr(self, "pin_btn", None)
@@ -1702,6 +1712,11 @@ class Widget(QWidget):
         color = QColor(str(raw.get("accent") or ""))
         if color.isValid():
             self.cfg["accent"] = color.name().upper()
+        if "status_color" in raw:
+            # пустая строка — «как цвет полос» (акцент)
+            text = str(raw.get("status_color") or "").strip()
+            color = QColor(text)
+            self.cfg["status_color"] = color.name().upper() if color.isValid() else ""
         low = raw.get("low_battery", self.cfg.get("low_battery"))
         try:
             low = int(low or 0)
@@ -1906,6 +1921,8 @@ class Widget(QWidget):
         self._bt_sig = None          # старые ряды устройств будут пересобраны
         self._bt_rows = []
         self._bt_devs = []
+        self._bt_holder = None       # контейнер раздела (скрывается, если пусто)
+        self._bt_visible = None
         self._bars = []              # старые полоски удалятся вместе с деревом
         self._accent_labels = []
 
@@ -1980,21 +1997,27 @@ class Widget(QWidget):
         gpu_box, gpu_usage, gpu_bar, gpu_big = self._section("🖥 GPU")
         root.addLayout(gpu_box)
 
-        root.addWidget(self._sep())
+        self._bt_sep = self._sep()
+        root.addWidget(self._bt_sep)
 
-        bt_box = QVBoxLayout()
+        # «Беспроводные» — отдельный контейнер: если показывать нечего,
+        # раздел прячется целиком вместе с разделителем (см. refresh)
+        bt_holder = QWidget()
+        _no_mouse(bt_holder)
+        bt_box = QVBoxLayout(bt_holder)
+        bt_box.setContentsMargins(0, 0, 0, 0)
         bt_box.setSpacing(self._sc(8))
         bt_box.addWidget(self._label("📶 БЕСПРОВОДНЫЕ", 10, TXT_DIM, spacing=1.8))
         self._bt_lay = QVBoxLayout()
         self._bt_lay.setSpacing(self._sc(8))
         bt_box.addLayout(self._bt_lay)
-        root.addLayout(bt_box)
+        root.addWidget(bt_holder)
+        self._bt_holder = bt_holder
 
         self.lbl = {
             "cpu_temp": cpu_big, "cpu_use": cpu_usage, "cpu_bar": cpu_bar,
             "gpu_temp": gpu_big, "gpu_use": gpu_usage, "gpu_bar": gpu_bar,
         }
-        self._bt_sep = None
         self.setFixedWidth(self._sc(264))
         self._fit_height()
 
@@ -2021,9 +2044,13 @@ class Widget(QWidget):
 
         self._bt_sep = self._sep()
         root.addWidget(self._bt_sep)
-        self._bt_lay = QVBoxLayout()
+        bt_holder = QWidget()
+        _no_mouse(bt_holder)
+        self._bt_lay = QVBoxLayout(bt_holder)
+        self._bt_lay.setContentsMargins(0, 0, 0, 0)
         self._bt_lay.setSpacing(self._sc(3))
-        root.addLayout(self._bt_lay)
+        root.addWidget(bt_holder)
+        self._bt_holder = bt_holder
 
         self.setFixedWidth(self._sc(210))
         self._fit_height()
@@ -2084,14 +2111,14 @@ class Widget(QWidget):
         hottest = max([t for t in temps if t is not None], default=None)
         self._animate_accent(self._accent_target(
             hottest, [d.get("cpu_load"), d.get("gpu_load")], overheat))
-        accent = self._accent_now.name()
+        status = self._status_color().name()
         self._accent_labels = []
 
         for key, temp_key, load_key in (("cpu", "cpu_temp", "cpu_load"),
                                         ("gpu", "gpu_temp", "gpu_load")):
             temp = d[temp_key]
             hot = bool(overheat and temp is not None and temp >= overheat)
-            color = accent if hot else TXT
+            color = status if hot else TXT
             temp_lbl = self.lbl[key + "_temp"]
             if hot:
                 self._accent_labels.append(temp_lbl)
@@ -2129,11 +2156,22 @@ class Widget(QWidget):
         rows.sort(key=lambda r: 0 if r["online"] else 1)
 
         sig = tuple((r["name"], r["online"]) for r in rows)
-        if sig != self._bt_sig:
+        changed = sig != self._bt_sig
+        if changed:
             self._rebuild_bt_rows(rows, sig)
 
-        if self._bt_sep is not None:
-            self._bt_sep.setVisible(bool(rows))
+        # ни одного устройства в списке — скрываем раздел «Беспроводные»
+        # целиком: заголовок, список и разделитель
+        visible = bool(rows)
+        if visible != self._bt_visible:
+            self._bt_visible = visible
+            if self._bt_holder is not None:
+                self._bt_holder.setVisible(visible)
+            if self._bt_sep is not None:
+                self._bt_sep.setVisible(visible)
+            changed = True
+        if changed:
+            QTimer.singleShot(0, self._fit_height)
 
         for (glyph_lbl, name_lbl, pct_lbl, bar), dev in zip(self._bt_rows, rows):
             online, level = dev["online"], dev["level"]
@@ -2149,7 +2187,7 @@ class Widget(QWidget):
                 if low_now:
                     self._accent_labels.append(pct_lbl)
                 pct_lbl.setStyleSheet(
-                    f"color: {accent if low_now else TXT};"
+                    f"color: {status if low_now else TXT};"
                     "background: transparent;")
                 if bar is not None:
                     bar.setValue(int(level))
@@ -2491,6 +2529,7 @@ class SettingsDialog(QDialog):
         cfg = widget.cfg
         accent = cfg.get("accent", "#E31937")
         self._last_accent = accent
+        self._last_status = str(cfg.get("status_color") or "").strip().upper()
         scale = float(cfg.get("scale", 1.0))
 
         self.setWindowTitle("Настройки виджета")
@@ -2549,6 +2588,19 @@ class SettingsDialog(QDialog):
         accent_row.addWidget(self.accent_edit, 1)
         accent_row.addWidget(pick)
         form.addRow("Цвет полос", accent_row)
+
+        status_row = QHBoxLayout()
+        status_row.setSpacing(8)
+        self.status_edit = QLineEdit(str(cfg.get("status_color") or ""))
+        self.status_edit.setPlaceholderText("пусто = как цвет полос")
+        self.status_edit.setToolTip(
+            "Температура при перегреве и процент при низком заряде.\n"
+            "Пусто — берётся «Цвет полос» (с учётом автоцвета).")
+        status_pick = QPushButton("Палитра…")
+        status_pick.clicked.connect(self._pick_status_color)
+        status_row.addWidget(self.status_edit, 1)
+        status_row.addWidget(status_pick)
+        form.addRow("Цвет статусов", status_row)
 
         self.auto_sw = ToggleSwitch(bool(cfg.get("auto_accent", True)), accent,
                                     max(0.9, scale))
@@ -2738,6 +2790,7 @@ class SettingsDialog(QDialog):
         self.hover_sp.valueChanged.connect(self._emit_change)
         self.refresh_sp.valueChanged.connect(self._emit_change)
         self.accent_edit.textChanged.connect(self._text_changed)
+        self.status_edit.textChanged.connect(self._text_changed)
         self.hp_edit.textChanged.connect(self._text_changed)
         self.ms_edit.textChanged.connect(self._text_changed)
         self.hide_sw.toggled.connect(self._hide_toggled)
@@ -3018,6 +3071,14 @@ class SettingsDialog(QDialog):
         if color.isValid():
             self.accent_edit.setText(color.name())
 
+    def _pick_status_color(self):
+        current = QColor(self.status_edit.text().strip())
+        if not current.isValid():
+            current = QColor(self.accent_edit.text().strip() or "#E31937")
+        color = QColorDialog.getColor(current, self, "Цвет статусов")
+        if color.isValid():
+            self.status_edit.setText(color.name())
+
     # ------------------------------------------------- живое применение
 
     def _text_changed(self, *_args):
@@ -3059,6 +3120,15 @@ class SettingsDialog(QDialog):
         else:
             accent = self._last_accent           # недописанный hex не сбрасывает цвет
 
+        # статусный цвет: пустое поле — снова «как цвет полос»
+        status_text = self.status_edit.text().strip()
+        if not status_text:
+            self._last_status = ""
+        else:
+            status_color = QColor(status_text)
+            if status_color.isValid():
+                self._last_status = status_color.name().upper()
+
         def parse(text):
             return [w.strip() for w in text.split(",") if w.strip()]
 
@@ -3070,6 +3140,7 @@ class SettingsDialog(QDialog):
             "hover_opacity": self.hover_sp.value(),
             "refresh_sec": self.refresh_sp.value(),
             "accent": accent,
+            "status_color": self._last_status,
             "auto_accent": self.auto_sw.isChecked(),
             "hide_offline": self.hide_sw.isChecked(),
             "ignore": list(self._ignore),
