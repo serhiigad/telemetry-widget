@@ -1,0 +1,17 @@
+# live data — не публикуется
+config.json
+history.json
+stats.json
+
+# временные файлы и кэш
+__pycache__/
+*.py[cod]
+*.log
+.venv/
+venv/
+env/
+
+# служебные файлы скриншотов
+screenshots/_raw/
+screenshots/_*.png
+screenshots/_*.json

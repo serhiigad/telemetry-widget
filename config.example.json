@@ -1,0 +1,26 @@
+{
+  "font": "Segoe UI",
+  "scale": 1.0,
+  "opacity": 90,
+  "hover_fade": true,
+  "hover_opacity": 5,
+  "always_on_top": false,
+  "refresh_sec": 2.0,
+  "accent": "#E31937",
+  "auto_accent": true,
+  "pos": null,
+  "hide_offline": false,
+  "ignore": [],
+  "minimal": false,
+  "autostart": false,
+  "headphones": {
+    "match": []
+  },
+  "mouse": {
+    "match": []
+  },
+  "low_battery": 20,
+  "overheat": 85,
+  "names": [],
+  "screen": ""
+}
