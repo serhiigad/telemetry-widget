@@ -213,6 +213,25 @@ def _fmt_span(seconds):
     return f"{seconds} с"
 
 
+def _fmt_left(seconds, short=False):
+    """Сколько ещё протянёт: «6 ч 20 мин», в компактном режиме — «6 ч»."""
+    try:
+        seconds = max(0, int(seconds))
+    except (TypeError, ValueError):
+        return ""
+    if seconds <= 0:
+        return ""
+    hours, minutes = seconds // 3600, (seconds % 3600) // 60
+    if hours >= 24:
+        days = hours // 24
+        return f"{days} д" if short else f"{days} д {hours % 24} ч"
+    if short:
+        return f"{hours} ч" if hours else f"{max(1, minutes)} мин"
+    if hours:
+        return f"{hours} ч {minutes} мин" if minutes >= 5 else f"{hours} ч"
+    return f"{max(1, minutes)} мин"
+
+
 def _fmt_rate(rate):
     """Расход в процентах за час: «4,2 %/ч»."""
     try:
@@ -1880,7 +1899,7 @@ class Widget(QWidget):
         return box, usage, bar, big
 
     def _device_row(self, glyph):
-        """Ряд устройства: иконка + имя + процент + полоска заряда."""
+        """Ряд устройства: иконка + имя + процент + полоска заряда и остаток."""
         row = QVBoxLayout()
         row.setSpacing(self._sc(4))
         head = QHBoxLayout()
@@ -1895,12 +1914,27 @@ class Widget(QWidget):
         head.addWidget(name_lbl, 1)
         head.addWidget(pct_lbl)
         row.addLayout(head)
+        # остаток «≈ 6 ч 20 мин» — справа от полоски: высота ряда не растёт
+        foot = QHBoxLayout()
+        foot.setSpacing(self._sc(6))
+        left_lbl = self._label("", 8, TXT_DIM)
+        left_lbl.setAlignment(Qt.AlignmentFlag.AlignRight
+                              | Qt.AlignmentFlag.AlignVCenter)
+        left_lbl.hide()
         bar = self._bar(3)
-        row.addWidget(bar)
-        return row, glyph_lbl, name_lbl, pct_lbl, bar
+        # полоска ужимается, освобождая место подпись остатка
+        bar.setMinimumWidth(self._sc(24))
+        foot.addWidget(bar, 1)
+        foot.addWidget(left_lbl)
+        row.addLayout(foot)
+        return row, glyph_lbl, name_lbl, pct_lbl, bar, left_lbl
 
     def _device_row_compact(self, glyph):
-        """Компактный ряд устройства: иконка + имя + процент, без полоски."""
+        """Компактный ряд: иконка + имя + процент, без полоски.
+
+        Остаток заряда выводится второй строкой: в узкой панели отдельная
+        подпись в той же строке не помещается при крупном шрифте.
+        """
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(self._sc(5))
@@ -1908,11 +1942,20 @@ class Widget(QWidget):
         name_lbl = self._label("", 9, TXT_MID)
         name_lbl.setFixedWidth(self._sc(104))
         pct_lbl = self._label("", 9, TXT, QFont.Weight.Light)
+        left_lbl = self._label("", 8, TXT_DIM)
+        left_lbl.setAlignment(Qt.AlignmentFlag.AlignRight
+                              | Qt.AlignmentFlag.AlignVCenter)
+        left_lbl.hide()
         row.addWidget(glyph_lbl)
         row.addWidget(name_lbl)
         row.addStretch(1)
         row.addWidget(pct_lbl)
-        return row, glyph_lbl, name_lbl, pct_lbl, None
+        box = QVBoxLayout()
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(self._sc(1))
+        box.addLayout(row)
+        box.addWidget(left_lbl)
+        return box, glyph_lbl, name_lbl, pct_lbl, None, left_lbl
 
     def _build(self):
         old = self.layout()
@@ -2095,12 +2138,14 @@ class Widget(QWidget):
             _no_mouse(holder)
             glyph = device_glyph(dev["name"])
             if self.minimal:
-                lay, glyph_lbl, name_lbl, pct_lbl, bar = self._device_row_compact(glyph)
+                lay, glyph_lbl, name_lbl, pct_lbl, bar, left_lbl = \
+                    self._device_row_compact(glyph)
             else:
-                lay, glyph_lbl, name_lbl, pct_lbl, bar = self._device_row(glyph)
+                lay, glyph_lbl, name_lbl, pct_lbl, bar, left_lbl = \
+                    self._device_row(glyph)
             holder.setLayout(lay)
             self._bt_lay.addWidget(holder)
-            self._bt_rows.append((glyph_lbl, name_lbl, pct_lbl, bar))
+            self._bt_rows.append((glyph_lbl, name_lbl, pct_lbl, bar, left_lbl))
         self._bt_sig = sig
 
     def refresh(self):
@@ -2173,7 +2218,9 @@ class Widget(QWidget):
         if changed:
             QTimer.singleShot(0, self._fit_height)
 
-        for (glyph_lbl, name_lbl, pct_lbl, bar), dev in zip(self._bt_rows, rows):
+        fit = False
+        for (glyph_lbl, name_lbl, pct_lbl, bar, left_lbl), dev in zip(self._bt_rows,
+                                                                      rows):
             online, level = dev["online"], dev["level"]
             self._track_battery(dev)
             name_lbl.setStyleSheet(
@@ -2197,7 +2244,18 @@ class Widget(QWidget):
                 if bar is not None:
                     bar.setValue(0)
 
+            # остаток: «≈ 6 ч 20 мин» из статистики циклов разряда
+            rep = self.stats.report(dev["name"])
+            empty_in = rep.get("empty_in") if online and rep else None
+            left_text = "≈ " + _fmt_left(empty_in, self.minimal) if empty_in else ""
+            if bool(left_lbl.text()) != bool(left_text):
+                fit = True            # в компактном режиме меняется высота ряда
+            left_lbl.setText(left_text)
+            left_lbl.setVisible(bool(left_text))
+
         self._apply_bt_names()
+        if fit:
+            QTimer.singleShot(0, self._fit_height)
 
     def _track_battery(self, dev):
         """История заряда, статистика циклов и предупреждение о низком заряде."""
@@ -2255,8 +2313,8 @@ class Widget(QWidget):
     def _apply_bt_names(self):
         """Имена устройств обрезаются по фактической ширине (после раскладки)."""
         try:
-            for (_glyph, name_lbl, _pct, _bar), dev in zip(self._bt_rows,
-                                                           self._bt_devs):
+            for row, dev in zip(self._bt_rows, self._bt_devs):
+                name_lbl = row[1]
                 text = self.display_name(dev["name"])
                 width = name_lbl.width() - 2
                 if width < 20:                   # раскладка ещё не посчитана
