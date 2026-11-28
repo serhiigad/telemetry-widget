@@ -4986,7 +4986,10 @@ def handle_instance_request(server, widget):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Telemetry Widget")
-    app.setQuitOnLastWindowClosed(True)
+    # закрытие любого окна (настройки, история, устройства) не должно гасить
+    # виджет: при автоскрытии панель уже спрятана, и диалог остаётся
+    # единственным «окном выхода» — приложение тихо завершалось
+    app.setQuitOnLastWindowClosed(False)
 
     def _excepthook(exc_type, exc, tb):
         """Без консоли (pythonw) иначе ошибку не увидеть вообще."""
