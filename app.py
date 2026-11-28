@@ -26,8 +26,8 @@ from PySide6.QtCore import (
     QVariantAnimation, Signal,
 )
 from PySide6.QtGui import (
-    QAction, QColor, QCursor, QFont, QGuiApplication, QIcon, QPainter,
-    QPainterPath, QPen, QPixmap,
+    QAction, QColor, QCursor, QFont, QFontMetricsF, QGuiApplication, QIcon,
+    QPainter, QPainterPath, QPen, QPixmap,
 )
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
@@ -1877,7 +1877,17 @@ class Widget(QWidget):
         row.setSpacing(self._sc(3))
         big = self._label("—", 30, TXT, QFont.Weight.Light)
         unit = self._label("°C", 11, TXT_DIM)
-        unit.setAlignment(Qt.AlignmentFlag.AlignBottom)
+        unit.setAlignment(Qt.AlignmentFlag.AlignLeft
+                          | Qt.AlignmentFlag.AlignBottom)
+        # Поднимаем «°C» так, чтобы её оптический центр совпал с центром
+        # цифр: при выравнивании по низу метки единица читалась как нижний
+        # индекс. Отступ считается из метрик шрифта, поэтому работает при
+        # любом шрифте, размере и масштабе.
+        fb = QFontMetricsF(self._font(30, QFont.Weight.Light))
+        fu = QFontMetricsF(self._font(11))
+        lift = (fb.capHeight() - fu.capHeight()) / 2.0
+        pad = (fb.descent() - fu.descent()) + max(0.0, lift)
+        unit.setContentsMargins(0, 0, 0, max(0, int(round(pad))))
         row.addWidget(big)
         row.addWidget(unit)
         row.addStretch(1)
