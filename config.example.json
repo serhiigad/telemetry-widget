@@ -30,6 +30,7 @@
   "theme": "dark",
   "hover_card": true,
   "autohide_fullscreen": false,
+  "autohide_mode": "game",
   "autohide_edge": "nearest",
   "check_updates": true,
   "update_url": "https://raw.githubusercontent.com/serhiigad/telemetry-widget/main/version.json"

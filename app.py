@@ -106,7 +106,8 @@ DEFAULT_CONFIG = {
     "screen": "",            # монитор, на котором стоит виджет
     "theme": "dark",         # dark / graphite / light / system
     "hover_card": True,      # всплывающая карточка устройства под курсором
-    "autohide_fullscreen": False,   # прятаться, когда игра на весь экран
+    "autohide_fullscreen": False,   # автоскрытие в закладку у края экрана
+    "autohide_mode": "game",        # game (только полноэкранные игры) / always
     "autohide_edge": "nearest",     # nearest / left / right — куда уезжать
     "check_updates": True,   # проверять обновления на GitHub
     "update_url": "https://raw.githubusercontent.com/serhiigad/"
@@ -264,6 +265,8 @@ def load_config():
         cfg["theme"] = "dark"
     if str(cfg.get("autohide_edge") or "") not in ("nearest", "left", "right"):
         cfg["autohide_edge"] = "nearest"
+    if str(cfg.get("autohide_mode") or "") not in ("game", "always"):
+        cfg["autohide_mode"] = "game"
     return cfg
 
 
@@ -1975,14 +1978,16 @@ class Widget(QWidget):
                 continue
         return handles
 
-    def _check_fullscreen(self):
-        """Прятаться, только если игра во весь экран именно на нашем мониторе."""
-        if not bool(self.cfg.get("autohide_fullscreen")):
-            if self._auto_hidden:
-                self._exit_autohide()
-            return
-        if self._settings_open:
-            return
+    def _autohide_mode(self):
+        mode = str(self.cfg.get("autohide_mode") or "game")
+        return mode if mode in ("game", "always") else "game"
+
+    def _pointer_inside(self):
+        """Курсор над панелью — в режиме «всегда» прятать пока нечего."""
+        return self.rect().contains(self.mapFromGlobal(QCursor.pos()))
+
+    def _fullscreen_here(self):
+        """Полноэкранное окно открыто именно на мониторе виджета."""
         monitor = fullscreen_monitor()
         try:
             if _user32.GetForegroundWindow() in self._own_windows():
@@ -1990,15 +1995,36 @@ class Widget(QWidget):
         except Exception:
             pass
         mine = self._widget_monitor()
-        same = (monitor is not None and mine is not None
+        return (monitor is not None and mine is not None
                 and abs(monitor[0] - mine[0]) <= 2
                 and abs(monitor[1] - mine[1]) <= 2
                 and abs(monitor[2] - mine[2]) <= 2
                 and abs(monitor[3] - mine[3]) <= 2)
-        if same and not self._auto_hidden:
+
+    def _autohide_wanted(self):
+        """Пора ли уезжать в закладку (с учётом режима из настроек)."""
+        if not bool(self.cfg.get("autohide_fullscreen")):
+            return False
+        if self._settings_open or self._drag_offset is not None:
+            return False
+        if self._hold.isActive():
+            return False
+        if self._autohide_mode() == "always":
+            return not self._pointer_inside()
+        return self._fullscreen_here()
+
+    def _check_fullscreen(self):
+        """Следить за обстановкой: «всегда» или только полноэкранные игры."""
+        if self._auto_hidden:
+            # из закладки выходим, если режим выключили или игра закончилась;
+            # в режиме «всегда» закладка — обычное состояние, панель отдаёт _peek
+            if not bool(self.cfg.get("autohide_fullscreen")):
+                self._exit_autohide()
+            elif self._autohide_mode() == "game" and not self._fullscreen_here():
+                self._exit_autohide()
+            return
+        if self._autohide_wanted():
             self._enter_autohide()
-        elif not same and self._auto_hidden:
-            self._exit_autohide()
 
     def _enter_autohide(self):
         """Спрятать панель, оставив закладку у ближайшего края своего монитора."""
@@ -2071,7 +2097,7 @@ class Widget(QWidget):
             return
         if self._hold.isActive():
             return
-        if self.rect().contains(self.mapFromGlobal(QCursor.pos())):
+        if self._pointer_inside():
             return
         self._back_to_tab()
 
@@ -4070,10 +4096,22 @@ class SettingsDialog(QDialog):
 
         self.autohide_sw = ToggleSwitch(bool(cfg.get("autohide_fullscreen")),
                                         accent, max(0.9, scale))
-        form.addRow("Скрывать в играх",
+        form.addRow("Автоскрытие",
                     self._toggle_row(
                         self.autohide_sw,
-                        "полноэкранная игра на этом мониторе — у края остаётся закладка"))
+                        "у края монитора остаётся закладка, наведение возвращает панель"))
+
+        self.autohide_cb = QComboBox()
+        for key, title in (("game", "Только в полноэкранных играх"),
+                           ("always", "Всегда, когда не наведена")):
+            self.autohide_cb.addItem(title, key)
+        self.autohide_cb.setCurrentIndex(max(
+            0, self.autohide_cb.findData(
+                str(cfg.get("autohide_mode") or "game"))))
+        self.autohide_cb.setToolTip(
+            "«Всегда» — панель живёт закладкой у края и выезжает только\n"
+            "под курсором или кликом по закладке.")
+        form.addRow("Когда прятать", self.autohide_cb)
 
         self.edge_cb = QComboBox()
         for key, title in (("nearest", "Ближайшая сторона"),
@@ -4140,6 +4178,8 @@ class SettingsDialog(QDialog):
         self.low_sp.setEnabled(self.low_sw.isChecked())
         self.hot_sp.setEnabled(self.hot_sw.isChecked())
         self.hover_sp.setEnabled(self.hover_sw.isChecked())
+        self.autohide_cb.setEnabled(self.autohide_sw.isChecked())
+        self.edge_cb.setEnabled(self.autohide_sw.isChecked())
 
         bottom = QHBoxLayout()
         hint = QLabel("Применяется сразу — сохранять не нужно")
@@ -4167,7 +4207,8 @@ class SettingsDialog(QDialog):
         self.font_cb.currentFontChanged.connect(self._emit_change)
         self.theme_cb.currentIndexChanged.connect(self._emit_change)
         self.card_sw.toggled.connect(self._emit_change)
-        self.autohide_sw.toggled.connect(self._emit_change)
+        self.autohide_sw.toggled.connect(self._autohide_toggled)
+        self.autohide_cb.currentIndexChanged.connect(self._emit_change)
         self.edge_cb.currentIndexChanged.connect(self._emit_change)
         self.update_sw.toggled.connect(self._emit_change)
         self.scale_sp.valueChanged.connect(self._emit_change)
@@ -4517,6 +4558,13 @@ class SettingsDialog(QDialog):
             self.autostart_sw.setChecked(actual)   # не удалось — вернуть как было
         self._emit_change()
 
+    def _autohide_toggled(self, *_args):
+        """Выключенное автоскрытие — выбор режима и стороны неактуален."""
+        enabled = self.autohide_sw.isChecked()
+        self.autohide_cb.setEnabled(enabled)
+        self.edge_cb.setEnabled(enabled)
+        self._emit_change()
+
     def _hover_toggled(self, *_args):
         self.hover_sp.setEnabled(self.hover_sw.isChecked())
         self._emit_change()
@@ -4557,6 +4605,7 @@ class SettingsDialog(QDialog):
             "theme": self.theme_cb.currentData(),
             "hover_card": self.card_sw.isChecked(),
             "autohide_fullscreen": self.autohide_sw.isChecked(),
+            "autohide_mode": self.autohide_cb.currentData() or "game",
             "autohide_edge": self.edge_cb.currentData(),
             "check_updates": self.update_sw.isChecked(),
             "font": self.font_cb.currentFont().family(),
