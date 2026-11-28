@@ -586,6 +586,7 @@ _user32.UnhookWindowsHookEx.restype = wintypes.BOOL
 # --------------------------------- удержание «поверх всех окон» (topmost)
 
 HWND_TOPMOST = -1
+HWND_NOTOPMOST = -2
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOACTIVATE = 0x0010
@@ -1642,7 +1643,9 @@ class Widget(QWidget):
 
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setWindowTitle("Telemetry Widget")
-        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)   # всегда поверх окон
+        # поверх всех окон — только в закреплённом режиме 📌
+        self.setWindowFlag(Qt.WindowStaysOnTopHint,
+                           bool(self.cfg.get("always_on_top")))
         # Виджет — единственное «главное» окно приложения. У окон типа Qt::Tool
         # этот флаг по умолчанию снят, и тогда закрытие окна настроек Qt считает
         # закрытием последнего окна — приложение завершалось. Возвращаем флаг:
@@ -1875,6 +1878,7 @@ class Widget(QWidget):
         super().showEvent(e)
         self._sync_mouse_hook()
         QTimer.singleShot(0, self._sync_tray)
+        QTimer.singleShot(0, self._apply_topmost)   # показались — сразу свой слой
 
     def hideEvent(self, e):
         super().hideEvent(e)
@@ -2446,20 +2450,26 @@ class Widget(QWidget):
 
     # ---------------------------------------- «поверх всех окон» (topmost)
 
+    def _wants_topmost(self):
+        """«Поверх всех окон» — только в закреплённом режиме (📌 нажата)."""
+        return bool(self._click_through)
+
     def _apply_topmost(self):
-        """Поднять окно в верхнюю полосу Z-порядка, не забирая фокус.
+        """Поставить окно в нужную полосу Z-порядка, не забирая фокус.
 
         Qt-флаг WindowStaysOnTopHint применяется только при создании окна,
         поэтому полноэкранные приложения (игры) могут оказаться выше.
         HWND_TOPMOST переставляем сами — при старте, при смене активного
-        окна и периодически.
+        окна и периодически; HWND_NOTOPMOST — когда 📌 отжата, чтобы
+        обычные окна могли перекрывать виджет.
         """
         if not self.isVisible():
             return
+        target = HWND_TOPMOST if self._wants_topmost() else HWND_NOTOPMOST
         try:
             hwnd = int(self.winId())
             _user32.SetWindowPos(ctypes.c_void_p(hwnd),
-                                 ctypes.c_void_p(HWND_TOPMOST),
+                                 ctypes.c_void_p(target),
                                  0, 0, 0, 0,
                                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
                                  | SWP_NOOWNERZORDER)
@@ -2513,8 +2523,11 @@ class Widget(QWidget):
             return
         if not hwnd:
             return
-        if not (_ex_style(hwnd) & WS_EX_TOPMOST) or self._covered_by_topmost():
-            self._apply_topmost()        # флаг потерян или чужая программа выше
+        if self._wants_topmost():
+            if not (_ex_style(hwnd) & WS_EX_TOPMOST) or self._covered_by_topmost():
+                self._apply_topmost()    # флаг потерян или чужая программа выше
+        elif _ex_style(hwnd) & WS_EX_TOPMOST:
+            self._apply_topmost()        # 📌 отжата — вернуть в обычный слой
         style = _ex_style(hwnd)
         want = (style | WS_EX_TRANSPARENT) if self._click_through \
             else (style & ~WS_EX_TRANSPARENT)
