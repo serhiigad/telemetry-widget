@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """История заряда и статистика циклов «заряд → разряд».
 
-`history.json` — точки заряда за последние сутки (для графика).
+`history.json` — точки заряда за последнюю неделю (для графика): сутки
+подробно (точка раз в 5 минут), дальше — прореженные (раз в 30 минут).
 `stats.json` — длительная статистика: сколько устройство проработало от одной
 зарядки до следующей. Если заряд вырос (устройство заряжали), текущий цикл
 завершается и его время сохраняется. Данные устройств, которые не появлялись
@@ -12,9 +13,12 @@ import json
 import os
 import time
 
-KEEP_SEC = 24 * 3600      # сколько храним точки графика (сутки)
-STEP_SEC = 300            # минимальный интервал между точками (5 минут)
-MAX_POINTS = KEEP_SEC // STEP_SEC + 12
+KEEP_SEC = 24 * 3600      # сколько храним подробные точки графика (сутки)
+KEEP_LONG_SEC = 7 * 24 * 3600   # общий срок хранения точек (неделя)
+STEP_SEC = 300            # минимальный интервал между свежими точками (5 минут)
+THIN_SEC = 1800           # точки старше суток прореживаем до одной в 30 минут
+MAX_POINTS = (KEEP_SEC // STEP_SEC
+              + (KEEP_LONG_SEC - KEEP_SEC) // THIN_SEC + 24)
 
 STATS_KEEP_SEC = 365 * 24 * 3600   # статистику устройства храним год
 KEEP_DAYS = 60            # дневной расход (для графика по дням) — 60 дней
@@ -50,6 +54,33 @@ def _valid_day(day):
         return False
 
 
+def thin(points, now=None):
+    """Проредить точки: сутки подробно, дальше — одна точка в 30 минут.
+
+    Старше недели точки отбрасываются. Функция идемпотентна: повторный вызов
+    на уже прореженных данных ничего не меняет.
+    """
+    now = float(now if now is not None else time.time())
+    old, fresh = [], []
+    for p in points:
+        age = now - p[0]
+        if age <= KEEP_SEC:
+            fresh.append(p)
+        elif age <= KEEP_LONG_SEC:
+            old.append(p)
+    # по корзинам, а не по соседним точкам: результат не зависит от того,
+    # сколько раз функцию уже вызывали (иначе шаг «уплывал» к 5 минутам)
+    kept = []
+    seen = set()
+    for p in old:
+        bucket = int(p[0] // THIN_SEC)
+        if bucket in seen:
+            continue
+        seen.add(bucket)
+        kept.append(p)
+    return kept + fresh
+
+
 class History:
     """Кольцевая история заряда: load() → add() по мере обновления данных."""
 
@@ -79,12 +110,13 @@ class History:
                     ts, level = float(p[0]), int(p[1])
                 except Exception:
                     continue
-                if now - ts <= KEEP_SEC and 0 <= level <= 100:
+                if now - ts <= KEEP_LONG_SEC and 0 <= level <= 100:
                     points.append([ts, level])
+            points = thin(points, now)[-MAX_POINTS:]
             if points:
                 self.devices[str(key)] = {
                     "name": str(item.get("name") or key),
-                    "points": points[-MAX_POINTS:],
+                    "points": points,
                 }
 
     def save(self):
@@ -121,18 +153,19 @@ class History:
         if points and now - points[-1][0] < STEP_SEC:
             return False                  # слишком часто — точку не пишем
         points.append([now, level])
+        item["points"] = thin(points, now)
+        points = item["points"]
         if len(points) > MAX_POINTS:
             del points[:-MAX_POINTS]
         self._dirty = True
         return True
 
     def prune(self, now=None):
-        """Убрать точки старше суток (вызывается при старте и раз в час)."""
+        """Проредить и убрать точки старше недели (при старте и раз в час)."""
         now = float(now if now is not None else time.time())
         changed = False
         for key in list(self.devices):
-            points = [p for p in self.devices[key]["points"]
-                      if now - p[0] <= KEEP_SEC]
+            points = thin(self.devices[key]["points"], now)
             if points != self.devices[key]["points"]:
                 self.devices[key]["points"] = points
                 changed = True
@@ -143,9 +176,17 @@ class History:
             self._dirty = True
         return changed
 
-    def series(self, key):
+    def series(self, key, hours=None, now=None):
+        """Точки заряда. hours — сколько последних часов вернуть (None — все)."""
         item = self.devices.get(_key(key))
-        return list(item["points"]) if item else []
+        if not item:
+            return []
+        points = list(item["points"])
+        if hours:
+            now = float(now if now is not None else time.time())
+            cutoff = now - float(hours) * 3600
+            points = [p for p in points if p[0] >= cutoff]
+        return points
 
     def name_of(self, key):
         item = self.devices.get(_key(key))
@@ -182,10 +223,11 @@ class History:
                     continue
                 if 0 <= level <= 100:
                     points.append([ts, level])
+            points = thin(points)[-MAX_POINTS:]
             if points:
                 self.devices[str(key)] = {
                     "name": str(item.get("name") or key),
-                    "points": points[-MAX_POINTS:],
+                    "points": points,
                 }
         self._dirty = True
 

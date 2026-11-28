@@ -3,6 +3,10 @@ config.json
 history.json
 stats.json
 
+# скачанные обновления и собранные архивы
+updates/
+dist/
+
 # временные файлы и кэш
 __pycache__/
 *.py[cod]
@@ -16,5 +20,5 @@ screenshots/_raw/
 screenshots/_*.png
 screenshots/_*.json
 
-# ������ ������ ������
+# ������ ������ ������
 assets/icons/_preview.png

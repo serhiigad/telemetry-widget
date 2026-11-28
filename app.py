@@ -18,12 +18,13 @@ import math
 import os
 import sys
 import time
+import traceback
 import winreg
 from ctypes import wintypes
 
 from PySide6.QtCore import (
-    Qt, QEasingCurve, QPoint, QPointF, QRect, QRectF, QSize, QTimer,
-    QVariantAnimation, Signal,
+    Qt, QEasingCurve, QPoint, QPointF, QProcess, QRect, QRectF, QSize,
+    QThread, QTimer, QVariantAnimation, Signal,
 )
 from PySide6.QtGui import (
     QAction, QColor, QCursor, QFont, QFontMetricsF, QGuiApplication, QIcon,
@@ -43,6 +44,32 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, APP_DIR)
 import monitor  # noqa: E402
 import history  # noqa: E402
+try:
+    import updater  # noqa: E402
+except Exception:            # модуль не скопировали — живём без автообновления
+    updater = None
+
+
+class _UpdateWorker(QThread):
+    """Проверка и скачивание обновления в фоне: сеть не должна ждать UI."""
+
+    done = Signal(object, str, bool)      # (состояние | None, ошибка, вручную)
+
+    def __init__(self, url, app_dir):
+        super().__init__()
+        self.url = url
+        self.app_dir = app_dir
+        self.manual = False
+
+    def run(self):
+        try:
+            info = updater.check(self.url, self.app_dir)
+            if not info:
+                self.done.emit(None, "", self.manual)
+                return
+            self.done.emit(updater.stage(info, self.app_dir), "", self.manual)
+        except Exception as exc:                     # noqa: BLE001
+            self.done.emit(None, str(exc), self.manual)
 
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 HISTORY_PATH = os.path.join(APP_DIR, "history.json")
@@ -73,50 +100,143 @@ DEFAULT_CONFIG = {
     "low_battery": 20,       # уведомлять о заряде ниже, % (0 = выключено)
     "overheat": 85,          # уведомлять о температуре выше, °C (0 = выключено)
     "names": [],             # свои названия: [["rb-m500b", "Наушники"], ...]
+    "device_low": {},        # свои пороги низкого заряда: {имя: %}, 0 = не следить
+    "order": [],             # порядок устройств в списке (системные имена)
+    "prune_days": 90,        # забывать устройства, не появлявшиеся N дней (0 = никогда)
     "screen": "",            # монитор, на котором стоит виджет
+    "theme": "dark",         # dark / graphite / light / system
+    "hover_card": True,      # всплывающая карточка устройства под курсором
+    "autohide_fullscreen": False,   # прятаться, когда игра на весь экран
+    "autohide_edge": "nearest",     # nearest / left / right — куда уезжать
+    "check_updates": True,   # проверять обновления на GitHub
+    "update_url": "https://raw.githubusercontent.com/serhiigad/"
+                  "telemetry-widget/main/version.json",
 }
 
 HP_HINTS = ("наушник", "гарнитур", "headphone", "headset", "airpod", "earbud",
             "buds", "soundcore", "tozo", "wh-", "wf-", "panasonic", "rb-m500")
 MS_HINTS = ("мышь", "mouse")
 
-TXT_DIM = "#7A7A84"
-TXT_OFF = "#57575F"
-TXT_MID = "#B8B8C0"
-TXT = "#F2F2F5"
+# ------------------------------------------------------------------- темы
+# Цвета живут в THEMES, а глобальные имена ниже — то, что читают _label(),
+# paintEvent() и QSS: apply_theme() переставляет их и пересобирает виджет.
 
-# тёмная тема окна настроек
-DIALOG_QSS = """
-QDialog { background: #13131A; }
-QLabel { color: #E9E9EF; background: transparent; }
-QLineEdit, QComboBox, QFontComboBox, QSpinBox, QDoubleSpinBox {
-    background: #1D1D26; color: #F2F2F5;
-    border: 1px solid #2F2F3A; border-radius: 6px;
+THEMES = {
+    "dark": {
+        "panel": "#0B0B0E", "text": "#F2F2F5", "mid": "#B8B8C0",
+        "dim": "#7A7A84", "off": "#57575F", "track": (255, 255, 255),
+        "border": (255, 255, 255), "border_alpha": 24, "title": "Тёмная",
+        "dialog": "#13131A", "input": "#1D1D26", "line": "#2F2F3A",
+        "button": "#23232D", "button_hover": "#2C2C38",
+        "button_down": "#1B1B23", "button_line": "#34343F",
+    },
+    "graphite": {
+        "panel": "#17181C", "text": "#EDEFF2", "mid": "#B4BAC2",
+        "dim": "#7E858F", "off": "#5A616B", "track": (255, 255, 255),
+        "border": (255, 255, 255), "border_alpha": 30, "title": "Графит",
+        "dialog": "#1B1D21", "input": "#24262B", "line": "#3A3D43",
+        "button": "#2B2D33", "button_hover": "#35383E",
+        "button_down": "#202226", "button_line": "#3F4249",
+    },
+    "light": {
+        "panel": "#EDEFF3", "text": "#14161A", "mid": "#3B4148",
+        "dim": "#6A7079", "off": "#949AA2", "track": (0, 0, 0),
+        "border": (0, 0, 0), "border_alpha": 40, "title": "Светлая",
+        "dialog": "#F6F7F9", "input": "#FFFFFF", "line": "#C9CED6",
+        "button": "#E6E9EE", "button_hover": "#DCE0E7",
+        "button_down": "#D2D7DE", "button_line": "#C2C8D0",
+    },
+}
+THEME_CHOICES = (("dark", "Тёмная"), ("graphite", "Графит"),
+                 ("light", "Светлая"), ("system", "Как в Windows"))
+
+THEME_NAME = "dark"          # фактическая тема (system уже развёрнут)
+BG_PANEL = THEMES["dark"]["panel"]
+TXT = THEMES["dark"]["text"]
+TXT_MID = THEMES["dark"]["mid"]
+TXT_DIM = THEMES["dark"]["dim"]
+TXT_OFF = THEMES["dark"]["off"]
+TRACK_RGB = THEMES["dark"]["track"]
+BORDER_RGB = THEMES["dark"]["border"]
+BORDER_ALPHA = THEMES["dark"]["border_alpha"]
+DIALOG_QSS = ""
+
+
+def _theme_variant(name):
+    """Имя темы. «system» разворачивается по AppsUseLightTheme Windows."""
+    if name in THEMES:
+        return name
+    if name != "system":
+        return "dark"
+    try:
+        with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+            light, _kind = winreg.QueryValueEx(k, "AppsUseLightTheme")
+        return "light" if int(light) else "dark"
+    except (OSError, ValueError, TypeError):
+        return "dark"
+
+
+def _dialog_qss(p, accent):
+    """QSS диалогов под текущую тему (акцент — как «цвет полос»)."""
+    return f"""
+QDialog {{ background: {p["dialog"]}; }}
+QLabel {{ color: {p["text"]}; background: transparent; }}
+QLineEdit, QComboBox, QFontComboBox, QSpinBox, QDoubleSpinBox {{
+    background: {p["input"]}; color: {p["text"]};
+    border: 1px solid {p["line"]}; border-radius: 6px;
     padding: 3px 6px; min-height: 20px;
-    selection-background-color: #E31937;
-}
-QComboBox::drop-down, QFontComboBox::drop-down {
+    selection-background-color: {accent};
+}}
+QComboBox::drop-down, QFontComboBox::drop-down {{
     border: none; width: 18px;
-}
-QComboBox QAbstractItemView, QFontComboBox QAbstractItemView {
-    background: #1D1D26; color: #F2F2F5;
-    border: 1px solid #2F2F3A; outline: none;
-    selection-background-color: #E31937;
-}
-QPushButton {
-    background: #23232D; color: #F2F2F5;
-    border: 1px solid #34343F; border-radius: 6px;
+}}
+QComboBox QAbstractItemView, QFontComboBox QAbstractItemView {{
+    background: {p["input"]}; color: {p["text"]};
+    border: 1px solid {p["line"]}; outline: none;
+    selection-background-color: {accent};
+}}
+QPushButton {{
+    background: {p["button"]}; color: {p["text"]};
+    border: 1px solid {p["button_line"]}; border-radius: 6px;
     padding: 6px 16px; min-width: 74px;
-}
-QPushButton:hover { background: #2C2C38; }
-QPushButton:pressed { background: #1B1B23; }
+}}
+QPushButton:hover {{ background: {p["button_hover"]}; }}
+QPushButton:pressed {{ background: {p["button_down"]}; }}
+QScrollArea {{ background: transparent; border: none; }}
+QCheckBox {{ color: {p["text"]}; }}
 /* стрелки спинбоксов скрываем: при NoButtons Qt не рисует текст,
    если на спинбокс навешен стиль, поэтому прячем их шириной */
 QSpinBox::up-button, QSpinBox::down-button,
-QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
     width: 0; border: none;
-}
+}}
 """
+
+
+def apply_theme(cfg):
+    """Переставить глобальные цвета под тему из настроек.
+
+    Функции отрисовки читают эти имена при вызове, поэтому достаточно
+    пересобрать интерфейс (_build) — диалоги берут QSS при создании.
+    """
+    global THEME_NAME, BG_PANEL, TXT, TXT_MID, TXT_DIM, TXT_OFF
+    global TRACK_RGB, BORDER_RGB, BORDER_ALPHA, DIALOG_QSS
+    variant = _theme_variant(str(cfg.get("theme") or "dark"))
+    p = THEMES[variant]
+    THEME_NAME = variant
+    BG_PANEL = p["panel"]
+    TXT, TXT_MID = p["text"], p["mid"]
+    TXT_DIM, TXT_OFF = p["dim"], p["off"]
+    TRACK_RGB = tuple(p["track"])
+    BORDER_RGB = tuple(p["border"])
+    BORDER_ALPHA = int(p["border_alpha"])
+    accent = QColor(str(cfg.get("accent") or "#E31937"))
+    if not accent.isValid():
+        accent = QColor("#E31937")
+    DIALOG_QSS = _dialog_qss(p, accent.name())
+    return variant
 
 GWL_EXSTYLE = -20
 WS_EX_TRANSPARENT = 0x00000020
@@ -136,6 +256,14 @@ def load_config():
             cfg["mouse"].update(saved["mouse"])
     except Exception:
         pass
+    if not isinstance(cfg.get("device_low"), dict):
+        cfg["device_low"] = {}
+    if not isinstance(cfg.get("order"), list):
+        cfg["order"] = []
+    if str(cfg.get("theme") or "") not in dict(THEME_CHOICES):
+        cfg["theme"] = "dark"
+    if str(cfg.get("autohide_edge") or "") not in ("nearest", "left", "right"):
+        cfg["autohide_edge"] = "nearest"
     return cfg
 
 
@@ -189,6 +317,17 @@ def set_autostart(enable):
     except OSError:
         return False
     return autostart_enabled() == bool(enable)
+
+
+def log_error(text):
+    """Ошибка в файл: виджет обычно запущен через pythonw, без консоли."""
+    try:
+        with open(os.path.join(APP_DIR, "widget-error.log"), "a",
+                  encoding="utf-8") as f:
+            stamp = time.strftime("[%Y-%m-%d %H:%M:%S] ")
+            f.write(stamp + str(text).rstrip() + "\n")
+    except OSError:
+        pass
 
 
 def _no_mouse(widget):
@@ -468,6 +607,77 @@ _user32.GetWindowRect.argtypes = [wintypes.HWND,
                                   ctypes.POINTER(wintypes.RECT)]
 _user32.GetWindowRect.restype = wintypes.BOOL
 GW_HWNDPREV = 3
+
+# ------------------------------------- полноэкранное окно (автоскрытие в играх)
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD),
+                ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT),
+                ("dwFlags", wintypes.DWORD)]
+
+
+MONITOR_DEFAULTTONEAREST = 2
+QUNS_BUSY = 2
+QUNS_RUNNING_D3D_FULL_SCREEN = 3
+QUNS_PRESENTATION_MODE = 4
+
+_user32.GetForegroundWindow.restype = wintypes.HWND
+_user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+_user32.MonitorFromWindow.restype = wintypes.HANDLE
+_user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE,
+                                    ctypes.POINTER(_MONITORINFO)]
+_user32.GetMonitorInfoW.restype = wintypes.BOOL
+
+
+def _notification_state():
+    """SHQueryUserNotificationState: 3 — D3D во весь экран, 4 — презентация."""
+    try:
+        state = ctypes.c_int(0)
+        hr = ctypes.windll.shell32.SHQueryUserNotificationState(
+            ctypes.byref(state))
+        return state.value if hr == 0 else None
+    except Exception:
+        return None
+
+
+def fullscreen_monitor():
+    """Монитор активного полноэкранного окна (left, top, right, bottom).
+
+    Окно считается полноэкранным, если его прямоугольник совпадает с
+    монитором (не с рабочим столом: развёрнутое окно с панелью задач — нет).
+    Дополнительно учитываем состояние уведомлений Windows: D3D-fullscreen и
+    режим презентации считаются игрой даже при нестандартной геометрии.
+    """
+    try:
+        hwnd = _user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        rect = wintypes.RECT()
+        if not _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        if rect.right - rect.left < 320 or rect.bottom - rect.top < 240:
+            return None
+        mon = _user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        if not mon:
+            return None
+        info = _MONITORINFO()
+        info.cbSize = ctypes.sizeof(_MONITORINFO)
+        if not _user32.GetMonitorInfoW(mon, ctypes.byref(info)):
+            return None
+        m = info.rcMonitor
+        tol = 4
+        covers = (abs(rect.left - m.left) <= tol
+                  and abs(rect.top - m.top) <= tol
+                  and abs(rect.right - m.right) <= tol
+                  and abs(rect.bottom - m.bottom) <= tol)
+        if not covers and _notification_state() not in (
+                QUNS_RUNNING_D3D_FULL_SCREEN, QUNS_PRESENTATION_MODE):
+            return None
+        return (int(m.left), int(m.top), int(m.right), int(m.bottom))
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------- иконки
@@ -829,12 +1039,18 @@ class Sparkline(QWidget):
         self._fill = bool(on)
         self.update()
 
+    def set_accent(self, color):
+        color = QColor(color)
+        if color != self._accent:
+            self._accent = color
+            self.update()
+
     def paintEvent(self, _e):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         rect = QRectF(self.rect()).adjusted(1, 3, -1, -3)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(255, 255, 255, 10))
+        p.setBrush(QColor(*TRACK_RGB, 10))
         p.drawRoundedRect(rect, 4, 4)
         if len(self._points) < 2:
             p.setPen(QPen(QColor(TXT_OFF)))
@@ -915,7 +1131,7 @@ class DayRates(QWidget):
             bar_h = max(4.0, row_h - 7)
             by = y + (row_h - bar_h) / 2.0
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor(255, 255, 255, 12))
+            p.setBrush(QColor(*TRACK_RGB, 12))
             p.drawRoundedRect(QRectF(bx, by, bw, bar_h), 2, 2)
             fill = min(bw, bw * max(0.0, float(item["rate"])) / top)
             color = QColor(self._accent)
@@ -944,14 +1160,29 @@ class HistoryDialog(QDialog):
         root.setContentsMargins(18, 16, 18, 14)
         root.setSpacing(10)
 
-        title = QLabel("ЗАРЯД ЗА ПОСЛЕДНИЕ 24 ЧАСА")
-        f = title.font()
+        self._title = QLabel("ЗАРЯД ЗА ПОСЛЕДНИЕ 24 ЧАСА")
+        f = self._title.font()
         f.setPointSize(8)
         f.setWeight(QFont.Weight.DemiBold)
         f.setLetterSpacing(QFont.AbsoluteSpacing, 1.5)
-        title.setFont(f)
-        title.setStyleSheet(f"color: {TXT_DIM}; background: transparent;")
-        root.addWidget(title)
+        self._title.setFont(f)
+        self._title.setStyleSheet(f"color: {TXT_DIM}; background: transparent;")
+
+        # переключатель диапазона: сутки подробно / неделя прореженно
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        head.addWidget(self._title, 1)
+        self._range_hours = 24
+        self._range_buttons = []
+        for hours, label in ((24, "24 ч"), (24 * 7, "7 дней")):
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setChecked(hours == self._range_hours)
+            btn.setStyleSheet("QPushButton { padding: 2px 10px; min-width: 0; }")
+            btn.clicked.connect(lambda _c=False, h=hours: self._set_range(h))
+            head.addWidget(btn)
+            self._range_buttons.append((hours, btn))
+        root.addLayout(head)
 
         # строк может стать много (график заряда + прогноз + расход по дням),
         # поэтому список прокручивается и не растягивает окно на весь экран
@@ -992,6 +1223,18 @@ class HistoryDialog(QDialog):
         self._accent = accent
         self._reload()
 
+    def _set_range(self, hours):
+        """Переключить график между сутками и неделей."""
+        hours = 24 * 7 if int(hours) > 24 else 24
+        if hours == self._range_hours:
+            return
+        self._range_hours = hours
+        for value, btn in self._range_buttons:
+            btn.setChecked(value == hours)
+        self._title.setText("ЗАРЯД ЗА ПОСЛЕДНИЕ 24 ЧАСА" if hours == 24
+                            else "ЗАРЯД ЗА ПОСЛЕДНИЕ 7 ДНЕЙ")
+        self._reload()
+
     def _reload(self):
         while self._rows.count():
             item = self._rows.takeAt(0)
@@ -1014,7 +1257,7 @@ class HistoryDialog(QDialog):
         self._scroll.setVisible(bool(keys))
         pairs = self.widget_ref.cfg.get("names") or []
         for key in keys:
-            points = hist.series(key)
+            points = hist.series(key, hours=self._range_hours)
             rep = stats.report(key) if stats is not None else None
             if not points and not rep:
                 continue
@@ -1107,6 +1350,161 @@ class HistoryDialog(QDialog):
         self._reload()
 
 
+class HoverCard(QWidget):
+    """Всплывающая карточка устройства: заряд, спарклайн, расход и остаток."""
+
+    def __init__(self):
+        super().__init__(None, Qt.ToolTip | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        self.setFixedWidth(212)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(13, 11, 13, 11)
+        root.setSpacing(5)
+
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        self._icon = IconLabel("unknown", 14, TXT_MID)
+        self._name = QLabel("")
+        self._name.setStyleSheet(f"color: {TXT}; background: transparent;")
+        head.addWidget(self._icon)
+        head.addWidget(self._name, 1)
+        root.addLayout(head)
+
+        self._pct = QLabel("")
+        font = self._pct.font()
+        font.setPointSize(20)
+        font.setWeight(QFont.Weight.Light)
+        self._pct.setFont(font)
+        self._pct.setStyleSheet(f"color: {TXT}; background: transparent;")
+        root.addWidget(self._pct)
+
+        self._line = Sparkline()
+        self._line.setFixedHeight(32)
+        root.addWidget(self._line)
+
+        self._info = QLabel("")
+        self._info.setWordWrap(True)
+        self._info.setStyleSheet(f"color: {TXT_DIM}; background: transparent;"
+                                 " font-size: 8pt;")
+        root.addWidget(self._info)
+
+        self._extra = QLabel("")
+        self._extra.setWordWrap(True)
+        self._extra.setStyleSheet(f"color: {TXT_OFF}; background: transparent;"
+                                  " font-size: 8pt;")
+        root.addWidget(self._extra)
+
+    def update_data(self, name, icon, level, online, points, report, accent):
+        report = report or {}
+        self._icon.set_icon(icon)
+        self._icon.set_color(TXT_MID if online else TXT_OFF)
+        self._name.setText(name)
+        self._name.setStyleSheet(
+            f"color: {TXT if online else TXT_OFF}; background: transparent;")
+        if online and level is not None:
+            text = f"{level} %"
+        elif online:
+            text = "—"
+        else:
+            text = "офлайн"
+        self._pct.setText(text)
+        self._pct.setStyleSheet(f"color: {TXT}; background: transparent;")
+        self._line.set_accent(accent)
+        self._line.set_points(points)
+        self._line.setVisible(len(points) >= 2)
+
+        bits = []
+        if online and report:
+            if report.get("empty_in"):
+                bits.append("до разряда ≈ " + _fmt_span(report["empty_in"]))
+            rate = report.get("current_rate") or report.get("avg_rate")
+            if rate:
+                bits.append("расход ≈ " + _fmt_rate(rate))
+            if report.get("active"):
+                bits.append("сейчас " + _fmt_span(report["active"]))
+        self._info.setText(" · ".join(bits))
+        self._info.setVisible(bool(bits))
+
+        extra = []
+        if report.get("avg"):
+            extra.append("от 1 заряда ≈ " + _fmt_span(report["avg"]))
+        if report.get("cycles"):
+            extra.append(f"циклов {report['cycles']}")
+        if not online:
+            extra.append("нет связи · заряд последний известный")
+        self._extra.setText(" · ".join(extra))
+        self._extra.setVisible(bool(extra))
+        self.adjustSize()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        bg = QColor(BG_PANEL)
+        bg.setAlpha(248)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(bg)
+        p.drawRoundedRect(rect, 14, 14)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(*BORDER_RGB, 70), 1))
+        p.drawRoundedRect(rect, 14, 14)
+
+
+class EdgeTab(QWidget):
+    """Закладка у края монитора, пока виджет спрятан на время игры.
+
+    Ширина всего 12 px и зажата в пределах своего монитора — на соседний
+    экран ничего не вылезает.
+    """
+
+    def __init__(self, on_activate):
+        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        self._on_activate = on_activate
+        self._side = "right"
+        self._accent = QColor("#E31937")
+        self.setFixedWidth(12)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Наведите курсор — виджет выедет обратно")
+
+    def set_accent(self, color):
+        self._accent = QColor(color)
+        self.update()
+
+    def set_side(self, side):
+        self._side = side if side in ("left", "right") else "right"
+        self.update()
+
+    def enterEvent(self, _e):
+        if self._on_activate:
+            self._on_activate()
+
+    def mousePressEvent(self, e):
+        if self._on_activate:
+            self._on_activate()
+        e.accept()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(BG_PANEL))
+        p.drawRoundedRect(QRectF(0, 0, w, h), 6, 6)
+        p.setBrush(QColor(*BORDER_RGB, 60))
+        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), 6, 6)
+        bar = QColor(self._accent)
+        p.setBrush(bar)
+        pad = 5.0
+        p.drawRoundedRect(QRectF(w * 0.34, pad, max(2.0, w * 0.32), h - pad * 2),
+                          2, 2)
+
+
 # ------------------------------------------------------------------- Виджет
 
 class Widget(QWidget):
@@ -1118,6 +1516,7 @@ class Widget(QWidget):
     def __init__(self):
         super().__init__(None, Qt.FramelessWindowHint | Qt.Tool)
         self.cfg = load_config()
+        apply_theme(self.cfg)        # цвета под тему до первой сборки
         self._drag_offset = None
         self._built = False
         self._bt_sig = None
@@ -1166,6 +1565,7 @@ class Widget(QWidget):
         self._low_notified = set()   # устройства, о которых уже предупредили
         self._hot = False            # уже предупредили о перегреве
         self._bt_all = []            # последний полный список устройств (для настроек)
+        self.prune_old_devices()     # давно не виденные устройства — забыть
         self.tray = None
         self._tray_actions = {}
         self._history_dlg = None
@@ -1214,6 +1614,30 @@ class Widget(QWidget):
         self._topmost.setInterval(3000)
         self._topmost.timeout.connect(self._enforce_window_state)
 
+        # всплывающая карточка устройства под курсором
+        self._card = None
+        self._card_key = None
+        self._bt_holders = []
+
+        # автоскрытие в полноэкранных играх: панель → закладка у края
+        self._auto_hidden = False
+        self._saved_geo = None       # позиция до скрытия (cfg["pos"] не трогаем)
+        self._edge = "right"
+        self._tab = None
+        self._full_timer = QTimer(self)
+        self._full_timer.setInterval(1200)
+        self._full_timer.timeout.connect(self._check_fullscreen)
+        self._peek_timer = QTimer(self)
+        self._peek_timer.setInterval(400)
+        self._peek_timer.timeout.connect(self._peek_tick)
+
+        # обновления: сеть — в фоне, установка — при перезапуске
+        self._update_thread = None
+        self._update_version = ""
+        self._update_timer = QTimer(self)
+        self._update_timer.setInterval(4 * 3600 * 1000)
+        self._update_timer.timeout.connect(lambda: self.check_updates())
+
         self._build()
         self._apply_flags()
         self._update_pin_look()
@@ -1223,6 +1647,10 @@ class Widget(QWidget):
         self.timer.start(int(self.cfg["refresh_sec"] * 1000))
         self._hover.start()
         self._topmost.start()
+        self._full_timer.start()
+        self._update_timer.start()
+        if bool(self.cfg.get("check_updates", True)):
+            QTimer.singleShot(9000, lambda: self.check_updates())
 
         # история: подчищаем старые точки раз в час
         self._history_timer = QTimer(self)
@@ -1292,6 +1720,17 @@ class Widget(QWidget):
         menu.addAction(act)
         menu.addSeparator()
 
+        act = QAction("Проверить обновления", menu)
+        act.triggered.connect(lambda: self.check_updates(manual=True))
+        menu.addAction(act)
+
+        act = QAction("Обновить и перезапустить", menu)
+        act.triggered.connect(self.apply_update_restart)
+        act.setVisible(False)
+        self._tray_actions["update"] = act
+        menu.addAction(act)
+        menu.addSeparator()
+
         act = QAction("Выход", menu)
         act.triggered.connect(QApplication.instance().quit)
         menu.addAction(act)
@@ -1301,6 +1740,12 @@ class Widget(QWidget):
         self.tray.activated.connect(self._tray_activated)
         self.tray.show()
         self._sync_tray()
+        # обновление могло быть скачано в прошлом сеансе
+        if updater is not None:
+            staged = updater.pending(APP_DIR)
+            if staged:
+                self._update_version = str(staged.get("version") or "")
+        self._sync_update_action()
 
     def _tray_pixmap(self):
         """Иконка трея: канцелярская кнопка акцентным цветом."""
@@ -1335,6 +1780,10 @@ class Widget(QWidget):
             self._open_settings()
 
     def _toggle_visible(self):
+        if self._auto_hidden and not self.isVisible():
+            self._exit_autohide()      # из «закладки» виджет возвращается целиком
+            self._sync_tray()
+            return
         if self.isVisible():
             self.hide()
         else:
@@ -1349,6 +1798,7 @@ class Widget(QWidget):
 
     def hideEvent(self, e):
         super().hideEvent(e)
+        self._hide_hover_card()
         self._animate_fade(1.0)          # скрытый — не в затухании
         self._sync_mouse_hook()          # скрытый виджет не ловит клики
         QTimer.singleShot(0, self._sync_tray)
@@ -1379,6 +1829,7 @@ class Widget(QWidget):
             self.stats.save()
         else:
             self.stats.save()        # заодно сбрасываем накопленное на диск
+        self.prune_old_devices()
 
     def display_name(self, name):
         return apply_name_map(name, self.cfg.get("names") or [])
@@ -1428,8 +1879,334 @@ class Widget(QWidget):
         if (x, y) != (self.x(), self.y()):
             self.move(x, y)
 
+    # ------------------------------------------- карточка под курсором
+
+    def _device_row_at(self, pos):
+        """Ряд устройства под точкой pos: (прямоугольник, устройство)."""
+        for holder, dev in list(getattr(self, "_bt_holders", [])):
+            try:
+                if holder is None or holder.isHidden():
+                    continue
+                rect = QRect(holder.mapTo(self, QPoint(0, 0)), holder.size())
+            except RuntimeError:
+                continue
+            if rect.contains(pos):
+                return rect, dev
+        return None
+
+    def _update_hover_card(self, pos, inside):
+        """Карточка устройства под курсором (в обычном, не клик-сквозном режиме)."""
+        wanted = (bool(self.cfg.get("hover_card", True)) and inside
+                  and not self._click_through and not self._settings_open
+                  and not self._auto_hidden and self._drag_offset is None)
+        if not wanted:
+            self._hide_hover_card()
+            return
+        found = self._device_row_at(pos)
+        if found is None:
+            self._hide_hover_card()
+            return
+        rect, dev = found
+        key = (self._device_key(dev["name"]), bool(dev["online"]), dev["level"])
+        if (key == self._card_key and self._card is not None
+                and self._card.isVisible()):
+            return
+        self._card_key = key
+        self._show_hover_card(dev, rect)
+
+    def _show_hover_card(self, dev, row_rect):
+        if self._card is None:
+            self._card = HoverCard()
+        name = dev["name"]
+        report = self.stats.report(name) or {}
+        points = self.history.series(name, 24)
+        self._card.update_data(
+            self.display_name(name), dev.get("_icon") or device_icon(name),
+            dev["level"], bool(dev["online"]), points, report, self._accent_now)
+        self._place_hover_card(row_rect)
+        if not self._card.isVisible():
+            self._card.show()
+
+    def _place_hover_card(self, row_rect):
+        """Слева от виджета, а если места нет — справа; всегда в пределах экрана."""
+        card = self._card
+        if card is None:
+            return
+        card.adjustSize()
+        w = card.width() or 212
+        h = max(60, card.height())
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            card.move(self.x() - w - 8, self.y() + row_rect.top())
+            return
+        g = screen.availableGeometry()
+        x = self.x() - w - 8
+        if x < g.left():
+            x = self.x() + self.width() + 8
+        if x + w > g.right() + 1:
+            x = max(g.left(), g.right() + 1 - w)
+        y = self.y() + row_rect.top()
+        y = min(max(y, g.top()), max(g.top(), g.bottom() + 1 - h))
+        card.move(x, y)
+
+    def _hide_hover_card(self):
+        self._card_key = None
+        if self._card is not None and self._card.isVisible():
+            self._card.hide()
+
+    # ------------------------------------ автоскрытие в полноэкранных играх
+
+    def _widget_monitor(self):
+        """Свой монитор в координатах Win32 (right/bottom — не включая край)."""
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return None
+        g = screen.geometry()
+        return (g.left(), g.top(), g.right() + 1, g.bottom() + 1)
+
+    def _own_windows(self):
+        handles = set()
+        for win in (self, self._tab, self._card):
+            if win is None:
+                continue
+            try:
+                handles.add(int(win.winId()))
+            except RuntimeError:
+                continue
+        return handles
+
+    def _check_fullscreen(self):
+        """Прятаться, только если игра во весь экран именно на нашем мониторе."""
+        if not bool(self.cfg.get("autohide_fullscreen")):
+            if self._auto_hidden:
+                self._exit_autohide()
+            return
+        if self._settings_open:
+            return
+        monitor = fullscreen_monitor()
+        try:
+            if _user32.GetForegroundWindow() in self._own_windows():
+                monitor = None       # своё же окно полноэкранным не считаем
+        except Exception:
+            pass
+        mine = self._widget_monitor()
+        same = (monitor is not None and mine is not None
+                and abs(monitor[0] - mine[0]) <= 2
+                and abs(monitor[1] - mine[1]) <= 2
+                and abs(monitor[2] - mine[2]) <= 2
+                and abs(monitor[3] - mine[3]) <= 2)
+        if same and not self._auto_hidden:
+            self._enter_autohide()
+        elif not same and self._auto_hidden:
+            self._exit_autohide()
+
+    def _enter_autohide(self):
+        """Спрятать панель, оставив закладку у ближайшего края своего монитора."""
+        if not self.isVisible():
+            return
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        g = screen.availableGeometry()
+        self._auto_hidden = True
+        self._saved_geo = self.geometry()     # cfg["pos"] не перезаписываем
+        edge = str(self.cfg.get("autohide_edge") or "nearest")
+        if edge not in ("left", "right"):
+            center = self.x() + self.width() / 2.0
+            edge = "left" if center < g.left() + g.width() / 2.0 else "right"
+        self._edge = edge
+        self._hide_hover_card()
+        self.hide()
+        self._show_tab(g)
+        self._sync_tray()
+        self._sync_mouse_hook()
+
+    def _show_tab(self, g):
+        tab = self._tab
+        if tab is None:
+            tab = EdgeTab(self._peek)
+            self._tab = tab
+        tab.set_side(self._edge)
+        tab.set_accent(self._accent_now)
+        height = max(64, min(150, self._sc(96)))
+        if self._saved_geo is not None:
+            y = self._saved_geo.center().y() - height // 2
+        else:
+            y = g.top() + 120
+        y = min(max(y, g.top()), max(g.top(), g.bottom() + 1 - height))
+        x = g.left() if self._edge == "left" else g.right() + 1 - tab.width()
+        tab.move(x, y)
+        tab.resize(tab.width(), height)
+        tab.show()
+        tab.raise_()
+
+    def _peek(self):
+        """Закладку навели или нажали — показать виджет у этого края."""
+        if not self._auto_hidden:
+            return
+        if self._tab is not None:
+            self._tab.hide()
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        g = screen.availableGeometry()
+        x = (g.left() if self._edge == "left"
+             else g.right() + 1 - self.width())
+        if self._saved_geo is not None:
+            y = self._saved_geo.center().y() - self.height() // 2
+        else:
+            y = g.top() + 84
+        y = min(max(y, g.top()), max(g.top(), g.bottom() + 1 - self.height()))
+        self.move(x, y)
+        self.show()
+        self._apply_topmost()
+        self._peek_timer.start()
+
+    def _peek_tick(self):
+        """Мышь ушла с выглянувшей панели — вернуть закладку."""
+        if not self._auto_hidden or not self.isVisible():
+            self._peek_timer.stop()
+            return
+        if self._settings_open or self._drag_offset is not None:
+            return
+        if self._hold.isActive():
+            return
+        if self.rect().contains(self.mapFromGlobal(QCursor.pos())):
+            return
+        self._back_to_tab()
+
+    def _back_to_tab(self):
+        self._peek_timer.stop()
+        if not self._auto_hidden:
+            return
+        screen = self.screen() or QApplication.primaryScreen()
+        self._hide_hover_card()
+        self.hide()
+        if screen is not None:
+            self._show_tab(screen.availableGeometry())
+
+    def _exit_autohide(self):
+        """Игра закрылась — вернуть панель на сохранённое место."""
+        self._auto_hidden = False
+        self._peek_timer.stop()
+        if self._tab is not None:
+            self._tab.hide()
+        if self._saved_geo is not None:
+            self.move(self._saved_geo.topLeft())
+            self._saved_geo = None
+        self.show()
+        self._apply_topmost()
+        self._sync_tray()
+        self._sync_mouse_hook()
+
+    # ---------------------------------------------- обновления с GitHub
+
+    def _sync_update_action(self):
+        act = self._tray_actions.get("update")
+        if act is None:
+            return
+        if self._update_version:
+            act.setText(f"Обновить до {self._update_version} и перезапустить")
+            act.setVisible(True)
+        else:
+            act.setVisible(False)
+
+    def check_updates(self, manual=False):
+        """Проверить обновления в фоне (сеть не подвешивает интерфейс)."""
+        if updater is None:
+            if manual:
+                self._notify("Обновления", "Модуль updater.py не найден")
+            return
+        if not manual and not bool(self.cfg.get("check_updates", True)):
+            return
+        url = str(self.cfg.get("update_url") or "").strip()
+        if not url:
+            if manual:
+                self._notify("Обновления", "Не задан адрес version.json")
+            return
+        if self._update_thread is not None:
+            return               # проверка уже идёт (или поток ещё завершается)
+        thread = _UpdateWorker(url, APP_DIR)
+        thread.manual = bool(manual)
+        thread.done.connect(self._on_update_ready)
+        thread.finished.connect(lambda t=thread: self._on_update_finished(t))
+        self._update_thread = thread
+        thread.start()
+
+    def _on_update_ready(self, staged, error, manual):
+        """Результат проверки. Ссылку на поток здесь НЕ отпускаем.
+
+        QThread нельзя уничтожать, пока он работает: Qt в этом случае
+        аварийно завершает процесс. Именно так виджет «падал» на кнопке
+        «Проверить обновление» — ссылка сбрасывалась в этом слоте, а run()
+        ещё не успевал вернуться. Объект отпускаем в _on_update_finished.
+        """
+        try:
+            if error:
+                if manual:
+                    self._notify("Обновления", error)
+                return
+            if not staged:
+                if manual:
+                    version = updater.local_version(APP_DIR) if updater else "—"
+                    self._notify("Обновления",
+                                 f"Установлена последняя версия ({version})")
+                return
+            self._update_version = str(staged.get("version") or "")
+            self._sync_update_action()
+            self._notify(
+                "Обновление готово",
+                f"Версия {self._update_version} скачана и проверена по SHA-256. "
+                "Меню в трее → «Обновить и перезапустить».")
+        except Exception:                            # noqa: BLE001
+            log_error(traceback.format_exc())
+
+    def _on_update_finished(self, thread):
+        """Поток закончил работу — только теперь объект можно отпустить."""
+        QTimer.singleShot(0, lambda: self._release_update_thread(thread))
+
+    def _release_update_thread(self, thread):
+        if self._update_thread is thread:
+            self._update_thread = None
+
+    def apply_update_restart(self):
+        """Применить скачанное обновление и перезапустить виджет."""
+        if updater is None:
+            return
+        try:
+            version = updater.apply_pending(APP_DIR)
+        except Exception as exc:                     # noqa: BLE001
+            self._notify("Обновление", f"Не удалось применить: {exc}")
+            return
+        if not version:
+            self._notify("Обновление", "Нет готового обновления")
+            self._update_version = ""
+            self._sync_update_action()
+            return
+        self._relaunch()
+
+    def _relaunch(self):
+        """Перезапустить виджет новым процессом (после обновления)."""
+        app = QApplication.instance()
+        frozen = bool(getattr(sys, "frozen", False))
+        exe = sys.executable
+        if not frozen:
+            pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+            if os.path.exists(pythonw):
+                exe = pythonw
+        args = [] if frozen else [os.path.join(APP_DIR, "app.py")]
+        self.persist()
+        self._shutdown()
+        try:
+            QProcess.startDetached(exe, args, APP_DIR)
+        except Exception:
+            pass
+        if app is not None:
+            QTimer.singleShot(150, app.quit)
+
     def set_click_through(self, on):
         self._click_through = bool(on)
+        self._hide_hover_card()
         self.cfg["always_on_top"] = self._click_through
         save_config(self.cfg)
         self._hover_hot = False
@@ -1638,6 +2415,7 @@ class Widget(QWidget):
         pos = self.mapFromGlobal(QCursor.pos())
         inside = self.isVisible() and self.rect().contains(pos)
         self._update_fade(inside)
+        self._update_hover_card(pos, inside)
         if not self._click_through:
             self.pin_btn.set_hover(False)
             self.gear_btn.set_hover(False)
@@ -1695,10 +2473,10 @@ class Widget(QWidget):
 
     def _restyle_bar(self, bar, radius):
         bar.setStyleSheet(
-            "QProgressBar { background: rgba(255,255,255,0.09); border: none;"
+            "QProgressBar { background: rgba(%d,%d,%d,0.09); border: none;"
             f" border-radius: {radius:.0f}px; }}\n"
             f"QProgressBar::chunk {{ background: {self._accent_now.name()};"
-            f" border-radius: {radius:.0f}px; }}"
+            f" border-radius: {radius:.0f}px; }}" % TRACK_RGB
         )
 
     def _status_color(self):
@@ -1764,6 +2542,105 @@ class Widget(QWidget):
         return any(key == str(x).strip().casefold()
                    for x in (self.cfg.get("ignore") or [])
                    if str(x).strip())
+
+    def _low_override(self, name):
+        """Свой порог устройства из cfg["device_low"] (None — не задан)."""
+        overrides = self.cfg.get("device_low") or {}
+        if not isinstance(overrides, dict):
+            return None
+        key = str(name or "").strip().casefold()
+        for dev, value in overrides.items():
+            if str(dev).strip().casefold() != key:
+                continue
+            try:
+                return max(0, min(50, int(value)))
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def low_threshold(self, name, visual=False):
+        """Порог предупреждения для устройства: свой, иначе общий.
+
+        visual=True — цвет процента на панели: если общий порог выключен,
+        подсветка всё равно работает на 20 %, как раньше.
+        """
+        own = self._low_override(name)
+        if own is not None:
+            return own
+        try:
+            value = int(self.cfg.get("low_battery") or 0)
+        except (TypeError, ValueError):
+            value = 0
+        value = max(0, min(50, value))
+        if visual and not value:
+            return 20
+        return value
+
+    def _device_key(self, name):
+        return str(name or "").strip().casefold()
+
+    def _forget_device(self, name, save=True):
+        """Удалить устройство из истории, статистики, названий, порогов и порядка."""
+        key = self._device_key(name)
+        if not key:
+            return
+        self.stats.devices.pop(key, None)
+        self.history.devices.pop(key, None)
+        # свои названия: точное имя или старый шаблон-подстрока
+        names = []
+        for pair in self.cfg.get("names") or []:
+            if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+                continue
+            pattern = str(pair[0]).strip().casefold()
+            if pattern and (pattern == key or pattern in key):
+                continue
+            names.append([str(pair[0]).strip(), str(pair[1]).strip()])
+        self.cfg["names"] = names
+        self.cfg["ignore"] = [n for n in (self.cfg.get("ignore") or [])
+                              if str(n).strip().casefold() != key]
+        overrides = self.cfg.get("device_low") or {}
+        if isinstance(overrides, dict):
+            self.cfg["device_low"] = {
+                str(k): v for k, v in overrides.items()
+                if str(k).strip().casefold() != key}
+        self.cfg["order"] = [n for n in (self.cfg.get("order") or [])
+                             if str(n).strip().casefold() != key]
+        if save:
+            self.history.save()
+            self.stats.save()
+            save_config(self.cfg)
+            self.apply_config()
+
+    def prune_old_devices(self):
+        """Забыть устройства, не появлявшиеся дольше cfg["prune_days"].
+
+        Онлайн-устройства не трогаем, даже если статистика старая. Позиция
+        cfg["pos"] и настройки не затрагиваются.
+        """
+        try:
+            days = int(self.cfg.get("prune_days") or 0)
+        except (TypeError, ValueError):
+            days = 0
+        if days <= 0:
+            return 0
+        now = time.time()
+        online = {self._device_key(d.get("name"))
+                  for d in (self._bt_all or []) if d.get("online")}
+        removed = []
+        for key, item in list(self.stats.devices.items()):
+            name = str(item.get("name") or key)
+            if self._device_key(name) in online:
+                continue
+            last = float(item.get("last_seen") or 0)
+            if not last or now - last <= days * 86400:
+                continue
+            self._forget_device(name, save=False)
+            removed.append(name)
+        if removed:
+            self.history.save()
+            self.stats.save()
+            save_config(self.cfg)
+        return len(removed)
 
     def known_devices(self):
         """Все известные системные имена: онлайн, история, статистика, ignore."""
@@ -1861,6 +2738,21 @@ class Widget(QWidget):
                 matches = [str(m).strip() for m in value.get("match") or []
                            if str(m).strip()]
                 self.cfg[key] = {"match": matches}
+        num("prune_days", 0, 365, integer=True)
+        overrides = raw.get("device_low")
+        if isinstance(overrides, dict):
+            clean = {}
+            for dev, value in overrides.items():
+                if not str(dev).strip():
+                    continue
+                try:
+                    clean[str(dev).strip()] = max(0, min(50, int(value)))
+                except (TypeError, ValueError):
+                    continue
+            self.cfg["device_low"] = clean
+        if "order" in raw:
+            self.cfg["order"] = [str(n).strip() for n in raw.get("order") or []
+                                 if str(n).strip()]
 
     def import_data(self, path):
         """Заменить настройки и статистику данными из резервной копии.
@@ -1898,6 +2790,7 @@ class Widget(QWidget):
         return len(self.stats.devices)
 
     def apply_config(self):
+        apply_theme(self.cfg)        # тема могла измениться — цвета до сборки
         self.timer.setInterval(int(self.cfg["refresh_sec"] * 1000))
         self._accent_base = QColor(self.cfg.get("accent", "#E31937"))
         if not bool(self.cfg.get("auto_accent", True)):
@@ -1953,10 +2846,10 @@ class Widget(QWidget):
         bar.setFixedHeight(self._sc(height))
         radius = self._sc(height) / 2.0
         bar.setStyleSheet(
-            "QProgressBar { background: rgba(255,255,255,0.09); border: none;"
+            "QProgressBar { background: rgba(%d,%d,%d,0.09); border: none;"
             f" border-radius: {radius:.0f}px; }}\n"
             f"QProgressBar::chunk {{ background: {self._accent_now.name()};"
-            f" border-radius: {radius:.0f}px; }}"
+            f" border-radius: {radius:.0f}px; }}" % TRACK_RGB
         )
         self._bars.append((bar, radius))
         _no_mouse(bar)
@@ -1965,7 +2858,8 @@ class Widget(QWidget):
     def _sep(self):
         line = QFrame()
         line.setFixedHeight(1)
-        line.setStyleSheet("background: rgba(255,255,255,0.08); border: none;")
+        line.setStyleSheet("background: rgba(%d,%d,%d,0.10); border: none;"
+                           % TRACK_RGB)
         _no_mouse(line)
         return line
 
@@ -2075,8 +2969,10 @@ class Widget(QWidget):
         self._bt_devs = []
         self._bt_holder = None       # контейнер раздела (скрывается, если пусто)
         self._bt_visible = None
+        self._bt_holders = []        # (контейнер ряда, устройство) — для карточки
         self._bars = []              # старые полоски удалятся вместе с деревом
         self._accent_labels = []
+        self._hide_hover_card()
 
         self.minimal = bool(self.cfg.get("minimal"))
         root = QVBoxLayout(self)
@@ -2247,6 +3143,7 @@ class Widget(QWidget):
             if item.widget():
                 item.widget().deleteLater()
         self._bt_rows = []
+        self._bt_holders = []
         self._bt_devs = list(rows)
         for dev in rows:
             holder = QWidget()
@@ -2262,6 +3159,7 @@ class Widget(QWidget):
             holder.setLayout(lay)
             self._bt_lay.addWidget(holder)
             self._bt_rows.append((glyph_lbl, name_lbl, pct_lbl, bar, left_lbl))
+            self._bt_holders.append((holder, dev))
         self._bt_sig = sig
 
     def refresh(self):
@@ -2313,8 +3211,13 @@ class Widget(QWidget):
         rows = [x for x in (hp, ms) if x]
         rows.extend(x for x in devices if id(x) not in used
                     and not (not x["online"] and hide))
-        # офлайн-устройства — в конце списка (порядок остальных не меняется)
-        rows.sort(key=lambda r: 0 if r["online"] else 1)
+        # ручной порядок из настроек; офлайн-устройства всё равно в конце
+        order = {}
+        for index, name in enumerate(self.cfg.get("order") or []):
+            order.setdefault(self._device_key(name), index)
+        rows.sort(key=lambda r: (0 if r["online"] else 1,
+                                 order.get(self._device_key(r["name"]),
+                                           len(order))))
         # слоты «наушники»/«мышь» задают иконку даже для нестандартных имён
         for dev in rows:
             dev["_icon"] = device_icon(dev["name"])
@@ -2351,8 +3254,8 @@ class Widget(QWidget):
             glyph_lbl.set_color(TXT_MID if online else TXT_OFF)
             if online and level is not None:
                 pct_lbl.setText(f"{level} %")
-                warn_at = int(self.cfg.get("low_battery") or 0) or 20
-                low_now = level <= warn_at
+                warn_at = self.low_threshold(dev["name"], visual=True)
+                low_now = bool(warn_at) and level <= warn_at
                 if low_now:
                     self._accent_labels.append(pct_lbl)
                 pct_lbl.setStyleSheet(
@@ -2382,7 +3285,7 @@ class Widget(QWidget):
     def _track_battery(self, dev):
         """История заряда, статистика циклов и предупреждение о низком заряде."""
         name, online, level = dev["name"], dev["online"], dev["level"]
-        low = int(self.cfg.get("low_battery") or 0)
+        low = self.low_threshold(name)
         if not online or level is None:
             self._low_notified.discard(name)
             return
@@ -2579,13 +3482,13 @@ class Widget(QWidget):
         radius = self._sc(20)
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         fade = getattr(self, "_fade", 1.0)
-        bg = QColor("#0B0B0E")
+        bg = QColor(BG_PANEL)
         bg.setAlpha(round(255 * fade))
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(bg)
         p.drawRoundedRect(rect, radius, radius)
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(QColor(255, 255, 255, round(24 * fade)), 1))
+        p.setPen(QPen(QColor(*BORDER_RGB, round(BORDER_ALPHA * fade)), 1))
         p.drawRoundedRect(rect, radius, radius)
 
     def mousePressEvent(self, e):
@@ -2601,8 +3504,9 @@ class Widget(QWidget):
     def mouseReleaseEvent(self, e):
         if self._drag_offset is not None:
             self._drag_offset = None
-            self.cfg["pos"] = [self.x(), self.y()]
-            save_config(self.cfg)
+            if not self._auto_hidden:     # позицию за краем экрана не запоминаем
+                self.cfg["pos"] = [self.x(), self.y()]
+                save_config(self.cfg)
 
     def contextMenuEvent(self, e):
         menu = QMenu(self)
@@ -2646,6 +3550,10 @@ class Widget(QWidget):
         if not cfg_partial:
             return
         self.cfg.update(cfg_partial)
+        apply_theme(self.cfg)
+        hint = bool(self.cfg.get("autohide_fullscreen"))
+        if not hint and self._auto_hidden:
+            self._exit_autohide()
         self.timer.setInterval(max(200, int(float(self.cfg["refresh_sec"]) * 1000)))
         self.setWindowOpacity(float(self.cfg.get("opacity", 90)) / 100.0)
         if not bool(self.cfg.get("hover_fade", True)):
@@ -2674,7 +3582,10 @@ class Widget(QWidget):
 
     def persist(self):
         """Сохранить позицию, монитор и настройки (при закрытии окна и при выходе)."""
-        self.cfg["pos"] = [self.x(), self.y()]
+        if self._auto_hidden and self._saved_geo is not None:
+            self.cfg["pos"] = [self._saved_geo.x(), self._saved_geo.y()]
+        else:
+            self.cfg["pos"] = [self.x(), self.y()]
         scr = self.screen()
         if scr is not None:
             self.cfg["screen"] = scr.name()
@@ -2685,6 +3596,15 @@ class Widget(QWidget):
         self._uninstall_foreground_watch()
         self._topmost.stop()
         self._history_timer.stop()
+        self._full_timer.stop()
+        self._peek_timer.stop()
+        self._update_timer.stop()
+        thread = self._update_thread
+        if thread is not None and thread.isRunning():
+            thread.wait(2000)        # не даём Qt убить работающий поток
+        self._hide_hover_card()
+        if self._tab is not None:
+            self._tab.hide()
         self._shutdown()
         self.persist()
 
@@ -2697,6 +3617,212 @@ class Widget(QWidget):
 
 
 # ---------------------------------------------------------------- Настройки
+
+class DevicesDialog(QDialog):
+    """Порядок устройств, свои пороги низкого заряда и «забыть устройство»."""
+
+    def __init__(self, widget):
+        super().__init__(widget)
+        self.widget_ref = widget
+        self.setWindowTitle("Устройства")
+        self.setWindowFlags(Qt.Dialog | Qt.WindowStaysOnTopHint)
+        self.setMinimumWidth(560)
+        self.setStyleSheet(DIALOG_QSS)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 14)
+        root.setSpacing(10)
+
+        title = QLabel("УСТРОЙСТВА")
+        f = title.font()
+        f.setPointSize(8)
+        f.setWeight(QFont.Weight.DemiBold)
+        f.setLetterSpacing(QFont.AbsoluteSpacing, 1.5)
+        title.setFont(f)
+        title.setStyleSheet(f"color: {TXT_DIM}; background: transparent;")
+        root.addWidget(title)
+
+        hint = QLabel("Порядок задаётся стрелками и сохраняется сразу. "
+                      "Порог «общий» берётся из настроек сигналов; "
+                      "«не следить» отключает предупреждение для устройства.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {TXT_DIM}; background: transparent;")
+        root.addWidget(hint)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setMinimumHeight(220)
+        self._scroll.setMaximumHeight(560)
+        self._scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollArea > QWidget > QWidget { background: transparent; }")
+        content = QWidget()
+        content.setStyleSheet("background: transparent;")
+        self._rows = QVBoxLayout(content)
+        self._rows.setContentsMargins(0, 0, 8, 0)
+        self._rows.setSpacing(6)
+        self._scroll.setWidget(content)
+        root.addWidget(self._scroll, 1)
+
+        bottom = QHBoxLayout()
+        reset = QPushButton("Сбросить порядок")
+        reset.clicked.connect(self._reset_order)
+        bottom.addWidget(reset)
+        bottom.addStretch(1)
+        close = QPushButton("Закрыть")
+        close.clicked.connect(self.accept)
+        bottom.addWidget(close)
+        root.addLayout(bottom)
+
+        self._order = []
+        self._thresholds = {}
+        self._build_order()
+        self._rebuild()
+
+    # ------------------------------------------------------------- данные
+    def _build_order(self):
+        known = list(self.widget_ref.known_devices())
+        by_key = {self.widget_ref._device_key(n): n for n in known}
+        order = []
+        for name in self.widget_ref.cfg.get("order") or []:
+            key = self.widget_ref._device_key(name)
+            real = by_key.get(key, str(name))
+            if real and real not in order:
+                order.append(real)
+        for name in known:
+            if name not in order:
+                order.append(name)
+        self._order = order
+        raw = self.widget_ref.cfg.get("device_low") or {}
+        self._thresholds = {}
+        for name in order:
+            value = self.widget_ref._low_override(name)
+            if value is not None:
+                self._thresholds[name] = value
+
+    def _rebuild(self):
+        while self._rows.count():
+            item = self._rows.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        if not self._order:
+            empty = QLabel("Устройства появятся, когда виджет увидит "
+                           "беспроводные устройства Windows.")
+            empty.setWordWrap(True)
+            empty.setStyleSheet(f"color: {TXT_DIM}; background: transparent;")
+            self._rows.addWidget(empty)
+            self._rows.addStretch(1)
+            return
+        global_low = int(self.widget_ref.cfg.get("low_battery") or 0)
+        for index, name in enumerate(self._order):
+            holder = QWidget()
+            row = QHBoxLayout(holder)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(8)
+
+            icon = QLabel()
+            icon.setPixmap(icon_pixmap(device_icon(name), 18,
+                                       QColor(TXT_MID)) or QPixmap())
+            icon.setFixedSize(20, 20)
+            row.addWidget(icon)
+
+            label = QLabel(self.widget_ref.display_name(name))
+            label.setToolTip(name)
+            label.setMinimumWidth(150)
+            label.setStyleSheet(f"color: {TXT}; background: transparent;")
+            row.addWidget(label, 1)
+
+            combo = QComboBox()
+            options = [("общий (выкл.)" if not global_low
+                        else f"общий ({global_low} %)", None)]
+            options += [(f"{v} %", v) for v in (5, 10, 15, 20, 30, 50)]
+            options.append(("не следить", 0))
+            for text, _value in options:
+                combo.addItem(text)
+            current = self._thresholds.get(name)
+            if current is None:
+                combo.setCurrentIndex(0)
+            else:
+                for i, (_text, value) in enumerate(options):
+                    if value == current:
+                        combo.setCurrentIndex(i)
+                        break
+            combo.currentIndexChanged.connect(
+                lambda _i, dev=name, cb=combo, opts=options:
+                self._threshold_changed(dev, cb, opts))
+            row.addWidget(combo)
+
+            up = QPushButton("↑")
+            up.setToolTip("Выше")
+            up.setStyleSheet("QPushButton { padding: 2px 8px; min-width: 0; }")
+            up.setEnabled(index > 0)
+            up.clicked.connect(lambda _c=False, i=index: self._move(i, -1))
+            row.addWidget(up)
+
+            down = QPushButton("↓")
+            down.setToolTip("Ниже")
+            down.setStyleSheet("QPushButton { padding: 2px 8px; min-width: 0; }")
+            down.setEnabled(index < len(self._order) - 1)
+            down.clicked.connect(lambda _c=False, i=index: self._move(i, 1))
+            row.addWidget(down)
+
+            forget = QPushButton("Забыть")
+            forget.setToolTip("Удалить историю, статистику и настройки устройства")
+            forget.setStyleSheet("QPushButton { padding: 2px 8px; min-width: 0; }")
+            forget.clicked.connect(lambda _c=False, dev=name: self._forget(dev))
+            row.addWidget(forget)
+
+            self._rows.addWidget(holder)
+        self._rows.addStretch(1)
+
+    # ------------------------------------------------------------ действия
+    def _threshold_changed(self, name, combo, options):
+        value = options[combo.currentIndex()][1]
+        if value is None:
+            self._thresholds.pop(name, None)
+        else:
+            self._thresholds[name] = int(value)
+        self._apply()
+
+    def _move(self, index, delta):
+        target = index + delta
+        if not (0 <= target < len(self._order)):
+            return
+        self._order[index], self._order[target] = \
+            self._order[target], self._order[index]
+        self._apply()
+        self._rebuild()
+
+    def _reset_order(self):
+        self.widget_ref.cfg["order"] = []
+        self._build_order()
+        self._apply()
+        self._rebuild()
+
+    def _forget(self, name):
+        answer = QMessageBox.question(
+            self, "Забыть устройство",
+            f"Удалить историю, статистику и настройки устройства\n"
+            f"«{self.widget_ref.display_name(name)}»?\n\n"
+            "Пока устройство подключено, данные начнут копиться заново.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.widget_ref._forget_device(name)
+        self._order = [n for n in self._order if n != name]
+        self._thresholds.pop(name, None)
+        self._rebuild()
+
+    def _apply(self):
+        self.widget_ref.apply_live({
+            "order": list(self._order),
+            "device_low": dict(self._thresholds),
+        })
+
 
 class SettingsDialog(QDialog):
     """Тёмное окно настроек: всё применяется сразу, подтверждать нечего."""
@@ -2722,15 +3848,41 @@ class SettingsDialog(QDialog):
         root.setSpacing(4)
 
         form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
         form.setHorizontalSpacing(16)
         form.setVerticalSpacing(8)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft
                                | Qt.AlignmentFlag.AlignVCenter)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        root.addLayout(form)
+
+        # форма целиком прокручивается: на экране 1080p все строки не влезают
+        form_scroll = QScrollArea()
+        form_scroll.setWidgetResizable(True)
+        form_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        form_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        form_scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollArea > QWidget > QWidget { background: transparent; }")
+        form_content = QWidget()
+        form_content.setStyleSheet("background: transparent;")
+        form_content.setLayout(form)
+        form_scroll.setWidget(form_content)
+        root.addWidget(form_scroll, 1)
 
         # ------------------------------------------------------------- Вид
         form.addRow(self._head("Вид"))
+
+        self.theme_cb = QComboBox()
+        for key, title in THEME_CHOICES:
+            self.theme_cb.addItem(title, key)
+        self.theme_cb.setCurrentIndex(max(
+            0, self.theme_cb.findData(str(cfg.get("theme") or "dark"))))
+        self.theme_cb.setToolTip(
+            "Цвета панели и диалогов. «Как в Windows» следует за светлой/тёмной\n"
+            "темой оформления. Окно настроек перекрасится после повторного\n"
+            "открытия, виджет — сразу.")
+        form.addRow("Тема", self.theme_cb)
 
         self.font_cb = QFontComboBox()
         self.font_cb.setCurrentFont(QFont(cfg.get("font", "Segoe UI")))
@@ -2794,6 +3946,13 @@ class SettingsDialog(QDialog):
                     self._toggle_row(self.minimal_sw,
                                      "только цифры, без полос и разделов"))
 
+        self.card_sw = ToggleSwitch(bool(cfg.get("hover_card", True)), accent,
+                                    max(0.9, scale))
+        form.addRow("Карточка устройства",
+                    self._toggle_row(
+                        self.card_sw,
+                        "спарклайн, расход и остаток при наведении на строку"))
+
         # ---------------------------------------------------------- Данные
         form.addRow(self._head("Данные"))
 
@@ -2856,25 +4015,8 @@ class SettingsDialog(QDialog):
                     self._spin_row(self.hot_sw, self.hot_sp,
                                    "уведомление выше порога"))
 
-        raw_names = [[str(p[0]).strip(), str(p[1]).strip()]
-                     for p in (cfg.get("names") or [])
-                     if isinstance(p, (list, tuple)) and len(p) >= 2
-                     and str(p[0]).strip() and str(p[1]).strip()]
         self._name_entries = []
-        known = []
-        for dev in getattr(self.widget_ref, "_bt_all", []) or []:
-            name = (dev.get("name") or "").strip()
-            if name and name not in known:
-                known.append(name)
-        for pattern, alias in raw_names:
-            # старые записи хранили часть имени — подставляем живое имя
-            # устройства, если оно однозначно находится
-            matches = [n for n in known if pattern.lower() in n.lower()]
-            device = matches[0] if len(matches) == 1 else pattern
-            if any(device.lower() == d.lower()
-                   for d, _a in self._name_entries):
-                continue                      # одно устройство — одна строка
-            self._name_entries.append([device, alias])
+        self._load_name_entries()
         self._name_rows = []
         names_wrap = QWidget()
         names_lay = QVBoxLayout(names_wrap)
@@ -2903,12 +4045,63 @@ class SettingsDialog(QDialog):
         form.addRow("Свои названия", names_wrap)
         self._rebuild_name_rows()
 
+        devices_btn = QPushButton("Устройства: пороги и порядок…")
+        devices_btn.setToolTip("Свои пороги низкого заряда, порядок в списке "
+                               "и «забыть устройство»")
+        devices_btn.clicked.connect(self._open_devices)
+        form.addRow("", devices_btn)
+
+        self.prune_sp = QSpinBox()
+        self.prune_sp.setRange(0, 365)
+        self.prune_sp.setSuffix(" дн.")
+        self.prune_sp.setSpecialValueText("никогда")
+        self.prune_sp.setValue(int(cfg.get("prune_days", 90) or 0))
+        self.prune_sp.setToolTip("Устройства, не появлявшиеся дольше этого срока, "
+                                 "удаляются из истории, статистики и настроек. "
+                                 "«Никогда» — хранить всё.")
+        form.addRow("Забывать невидимые", self.prune_sp)
+
         history_btn = QPushButton("История заряда…")
         history_btn.clicked.connect(self.widget_ref._open_history)
         form.addRow("", history_btn)
 
         # --------------------------------------------------------- Система
         form.addRow(self._head("Система"))
+
+        self.autohide_sw = ToggleSwitch(bool(cfg.get("autohide_fullscreen")),
+                                        accent, max(0.9, scale))
+        form.addRow("Скрывать в играх",
+                    self._toggle_row(
+                        self.autohide_sw,
+                        "полноэкранная игра на этом мониторе — у края остаётся закладка"))
+
+        self.edge_cb = QComboBox()
+        for key, title in (("nearest", "Ближайшая сторона"),
+                           ("left", "Левая"), ("right", "Правая")):
+            self.edge_cb.addItem(title, key)
+        self.edge_cb.setCurrentIndex(max(
+            0, self.edge_cb.findData(str(cfg.get("autohide_edge") or "nearest"))))
+        form.addRow("Сторона автоскрытия", self.edge_cb)
+
+        self.update_sw = ToggleSwitch(bool(cfg.get("check_updates", True)),
+                                      accent, max(0.9, scale))
+        form.addRow("Проверять обновления",
+                    self._toggle_row(
+                        self.update_sw,
+                        "раз в 4 часа; установка — только после проверки SHA-256"))
+
+        upd_row = QHBoxLayout()
+        upd_row.setContentsMargins(0, 0, 0, 0)
+        upd_row.setSpacing(8)
+        upd_check = QPushButton("Проверить сейчас")
+        upd_check.clicked.connect(self._check_updates)
+        self.update_btn = QPushButton("Обновить и перезапустить")
+        self.update_btn.clicked.connect(self.widget_ref.apply_update_restart)
+        self.update_btn.setEnabled(bool(getattr(widget, "_update_version", "")))
+        upd_row.addWidget(upd_check)
+        upd_row.addWidget(self.update_btn)
+        upd_row.addStretch(1)
+        form.addRow("Обновления", upd_row)
 
         self.autostart_sw = ToggleSwitch(autostart_enabled(), accent,
                                          max(0.9, scale))
@@ -2940,7 +4133,8 @@ class SettingsDialog(QDialog):
         # стрелки спинбоксов скрыты в QSS (при NoButtons со стилем Qt теряет
         # текст значения), поля просто растягиваются по ширине
         for spin in (self.scale_sp, self.opacity_sp, self.hover_sp,
-                     self.refresh_sp, self.low_sp, self.hot_sp):
+                     self.refresh_sp, self.low_sp, self.hot_sp,
+                     self.prune_sp):
             spin.setSizePolicy(QSizePolicy.Policy.Expanding,
                                QSizePolicy.Policy.Fixed)
         self.low_sp.setEnabled(self.low_sw.isChecked())
@@ -2957,6 +4151,13 @@ class SettingsDialog(QDialog):
         root.addSpacing(6)
         root.addLayout(bottom)
 
+        # окно не должно вылезать за экран: форма прокручивается
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            g = screen.availableGeometry()
+            self.resize(min(560, max(470, g.width() - 80)),
+                        min(920, max(520, g.height() - 80)))
+
         # ---- живые связи: любое изменение тут же уходит в виджет
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -2964,11 +4165,17 @@ class SettingsDialog(QDialog):
         self._debounce.timeout.connect(self._emit_change)
 
         self.font_cb.currentFontChanged.connect(self._emit_change)
+        self.theme_cb.currentIndexChanged.connect(self._emit_change)
+        self.card_sw.toggled.connect(self._emit_change)
+        self.autohide_sw.toggled.connect(self._emit_change)
+        self.edge_cb.currentIndexChanged.connect(self._emit_change)
+        self.update_sw.toggled.connect(self._emit_change)
         self.scale_sp.valueChanged.connect(self._emit_change)
         self.opacity_sp.valueChanged.connect(self._emit_change)
         self.hover_sw.toggled.connect(self._hover_toggled)
         self.hover_sp.valueChanged.connect(self._emit_change)
         self.refresh_sp.valueChanged.connect(self._emit_change)
+        self.prune_sp.valueChanged.connect(self._emit_change)
         self.accent_edit.textChanged.connect(self._text_changed)
         self.status_edit.textChanged.connect(self._text_changed)
         self.hp_edit.textChanged.connect(self._text_changed)
@@ -3101,6 +4308,28 @@ class SettingsDialog(QDialog):
         self._name_rows.append((box, combo, edit, btn))
         return box
 
+    def _load_name_entries(self):
+        """Перечитать «свои названия» из конфига (после «Забыть устройство»)."""
+        raw_names = [[str(p[0]).strip(), str(p[1]).strip()]
+                     for p in (self.widget_ref.cfg.get("names") or [])
+                     if isinstance(p, (list, tuple)) and len(p) >= 2
+                     and str(p[0]).strip() and str(p[1]).strip()]
+        known = []
+        for dev in getattr(self.widget_ref, "_bt_all", []) or []:
+            name = (dev.get("name") or "").strip()
+            if name and name not in known:
+                known.append(name)
+        entries = []
+        for pattern, alias in raw_names:
+            # старые записи хранили часть имени — подставляем живое имя
+            # устройства, если оно однозначно находится
+            matches = [n for n in known if pattern.lower() in n.lower()]
+            device = matches[0] if len(matches) == 1 else pattern
+            if any(device.lower() == d.lower() for d, _a in entries):
+                continue                      # одно устройство — одна строка
+            entries.append([device, alias])
+        self._name_entries = entries
+
     def _rebuild_name_rows(self, focus=None):
         while self._name_box.count():
             item = self._name_box.takeAt(0)
@@ -3151,6 +4380,13 @@ class SettingsDialog(QDialog):
 
     def _hide_toggled(self, *_args):
         """Скрывать неактивные → список устройств в названиях тоже меняется."""
+        self._rebuild_name_rows()
+        self._emit_change()
+
+    def _open_devices(self):
+        dlg = DevicesDialog(self.widget_ref)
+        dlg.exec()
+        self._load_name_entries()
         self._rebuild_name_rows()
         self._emit_change()
 
@@ -3285,6 +4521,11 @@ class SettingsDialog(QDialog):
         self.hover_sp.setEnabled(self.hover_sw.isChecked())
         self._emit_change()
 
+    def _check_updates(self):
+        """Проверить обновления сейчас (ответ придёт уведомлением в трее)."""
+        self._emit_change()
+        self.widget_ref.check_updates(manual=True)
+
     def _signal_changed(self, *_args):
         """Низкий заряд / перегрев: порог активен только при включённом тумблере."""
         self.low_sp.setEnabled(self.low_sw.isChecked())
@@ -3313,6 +4554,11 @@ class SettingsDialog(QDialog):
             return [w.strip() for w in text.split(",") if w.strip()]
 
         return {
+            "theme": self.theme_cb.currentData(),
+            "hover_card": self.card_sw.isChecked(),
+            "autohide_fullscreen": self.autohide_sw.isChecked(),
+            "autohide_edge": self.edge_cb.currentData(),
+            "check_updates": self.update_sw.isChecked(),
             "font": self.font_cb.currentFont().family(),
             "scale": self.scale_sp.value(),
             "opacity": self.opacity_sp.value(),
@@ -3328,6 +4574,7 @@ class SettingsDialog(QDialog):
             "autostart": autostart_enabled(),
             "low_battery": self.low_sp.value() if self.low_sw.isChecked() else 0,
             "overheat": self.hot_sp.value() if self.hot_sw.isChecked() else 0,
+            "prune_days": self.prune_sp.value(),
             "names": [[dev.strip(), alias.strip()]
                       for dev, alias in self._name_entries
                       if dev.strip() and alias.strip()],
@@ -3343,25 +4590,34 @@ MUTEX_NAME = "Local\\DesktopTelemetryWidget"
 _instance_mutex = None      # хэндл живёт столько же, сколько процесс
 
 
-def acquire_single_instance():
-    """True — мы первая копия. Именованный мьютекс снимается сам при выходе."""
+def acquire_single_instance(retry_sec=0.0):
+    """True — мы первая копия. Именованный мьютекс снимается сам при выходе.
+
+    retry_sec — сколько ждать освобождения мьютекса: после обновления старая
+    копия может закрываться ещё несколько мгновений, и новый процесс не
+    должен из-за этого решить, что виджет уже запущен.
+    """
     global _instance_mutex
-    try:
-        kernel32 = ctypes.windll.kernel32
-        kernel32.CreateMutexW.restype = ctypes.c_void_p
-        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool,
-                                          ctypes.c_wchar_p]
-        handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
-        already = kernel32.GetLastError() == ERROR_ALREADY_EXISTS
-    except Exception:
-        return True          # не смогли проверить — не мешаем запуску
-    if not handle:
-        return True
-    if already:
+    deadline = time.monotonic() + max(0.0, float(retry_sec))
+    while True:
+        try:
+            kernel32 = ctypes.windll.kernel32
+            kernel32.CreateMutexW.restype = ctypes.c_void_p
+            kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool,
+                                              ctypes.c_wchar_p]
+            handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+            already = kernel32.GetLastError() == ERROR_ALREADY_EXISTS
+        except Exception:
+            return True          # не смогли проверить — не мешаем запуску
+        if not handle:
+            return True
+        if not already:
+            _instance_mutex = handle
+            return True
         kernel32.CloseHandle(handle)
-        return False
-    _instance_mutex = handle
-    return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
 
 
 def start_instance_server(app):
@@ -3402,8 +4658,14 @@ def main():
     app.setApplicationName("Telemetry Widget")
     app.setQuitOnLastWindowClosed(True)
 
+    def _excepthook(exc_type, exc, tb):
+        """Без консоли (pythonw) иначе ошибку не увидеть вообще."""
+        log_error("".join(traceback.format_exception(exc_type, exc, tb)))
+
+    sys.excepthook = _excepthook
+
     # ---- одна копия на сеанс: вторая подсвечивает первую и сразу выходит
-    if not acquire_single_instance():
+    if not acquire_single_instance(3.0):
         if not notify_running_instance():
             QMessageBox.information(
                 None, "Виджет уже запущен",
