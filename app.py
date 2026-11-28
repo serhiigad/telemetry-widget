@@ -47,6 +47,7 @@ import history  # noqa: E402
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 HISTORY_PATH = os.path.join(APP_DIR, "history.json")
 STATS_PATH = os.path.join(APP_DIR, "stats.json")
+ICON_DIR = os.path.join(APP_DIR, "assets", "icons")
 AUTOSTART_NAME = "DesktopTelemetryWidget"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 IPC_NAME = "DesktopTelemetryWidget-single"   # одна копия виджета на сеанс
@@ -314,6 +315,79 @@ def _blend(c1, c2, t):
     )
 
 
+# --------------------------------------------------------- растровые иконки
+
+_ICON_CACHE = {}
+
+
+def icon_pixmap(name, px, color, dpr=1.0):
+    """Белая PNG-иконка, тонированная в нужный цвет (с кэшем)."""
+    px = max(1, int(round(px)))
+    color = QColor(color)
+    key = (name, px, color.rgba(), round(float(dpr), 2))
+    cached = _ICON_CACHE.get(key)
+    if cached is not None:
+        return cached
+    path = os.path.join(ICON_DIR, str(name) + ".png")
+    src = QPixmap(path)
+    if src.isNull():
+        return None
+    src = src.scaled(px, px, Qt.AspectRatioMode.KeepAspectRatio,
+                     Qt.TransformationMode.SmoothTransformation)
+    tinted = QPixmap(src.size())
+    tinted.fill(Qt.GlobalColor.transparent)
+    p = QPainter(tinted)
+    p.drawPixmap(0, 0, src)
+    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+    p.fillRect(tinted.rect(), color)
+    p.end()
+    tinted.setDevicePixelRatio(float(dpr))
+    _ICON_CACHE[key] = tinted
+    return tinted
+
+
+class IconLabel(QWidget):
+    """Маленькая иконка из assets/icons с тонированием под тему."""
+
+    def __init__(self, name, size, color=TXT_MID, fallback=""):
+        super().__init__()
+        self._name = name
+        self._size = max(8, int(size))
+        self._color = QColor(color)
+        self._fallback = fallback
+        self.setFixedSize(self._size, self._size)
+        _no_mouse(self)
+
+    def set_color(self, color):
+        color = QColor(color)
+        if color != self._color:
+            self._color = color
+            self.update()
+
+    def set_icon(self, name, fallback=None):
+        if name != self._name:
+            self._name = name
+            self.update()
+        if fallback is not None:
+            self._fallback = fallback
+
+    def paintEvent(self, _e):
+        dpr = max(1.0, float(self.devicePixelRatioF()))
+        pm = icon_pixmap(self._name, self._size * dpr, self._color, dpr)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if pm is not None:
+            p.drawPixmap(0, 0, pm)
+            return
+        if self._fallback:
+            font = QFont("Segoe UI")
+            font.setPointSize(max(6, int(round(self._size * 0.62))))
+            p.setFont(font)
+            p.setPen(QPen(self._color))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
+                       self._fallback)
+
+
 def _ex_style(hwnd):
     get_ptr = getattr(ctypes.windll.user32, "GetWindowLongPtrW", None)
     if get_ptr is None:
@@ -408,6 +482,29 @@ GLYPH_RULES = (
     (("watch", "часы", "band", "fit"), "⌚"),
     (("phone", "телефон", "iphone", "galaxy s"), "📱"),
 )
+
+# порядок важен: earbuds проверяем раньше общих наушников
+ICON_RULES = (
+    (("airpod", "earbud", "buds", "tws", "freebuds", "galaxy buds",
+      "наушник-вкладыш"), "earbuds"),
+    (("headphone", "headset", "наушник", "гарнитур", "wh-", "wf-",
+      "panasonic", "rb-m500"), "headphones"),
+    (("mouse", "мышь", "superlight"), "mouse"),
+    (("keyboard", "клавиатур", "kbd", "keychron"), "keyboard"),
+    (("gamepad", "controller", "xbox", "джойстик", "геймпад",
+      "dualsense"), "gamepad"),
+    (("speaker", "колонк", "звук", "jbl"), "speaker"),
+    (("watch", "часы", "band", "fit"), "watch"),
+    (("phone", "телефон", "iphone", "galaxy s"), "phone"),
+)
+
+
+def device_icon(name):
+    nl = (name or "").lower()
+    for words, icon in ICON_RULES:
+        if any(w in nl for w in words):
+            return icon
+    return "unknown"
 
 
 def device_glyph(name):
@@ -1893,10 +1990,12 @@ class Widget(QWidget):
         row.addStretch(1)
         return row, big
 
-    def _section(self, title):
+    def _section(self, icon, title):
         box = QVBoxLayout()
         box.setSpacing(self._sc(6))
         head = QHBoxLayout()
+        head.setSpacing(self._sc(5))
+        head.addWidget(IconLabel(icon, self._sc(14), TXT_DIM))
         head.addWidget(self._label(title.upper(), 10, TXT_DIM, spacing=1.8))
         head.addStretch(1)
         usage = self._label("—", 10, TXT_DIM, spacing=0.6)
@@ -1908,13 +2007,13 @@ class Widget(QWidget):
         box.addLayout(vrow)
         return box, usage, bar, big
 
-    def _device_row(self, glyph):
+    def _device_row(self, icon, fallback=""):
         """Ряд устройства: иконка + имя + процент + полоска заряда и остаток."""
         row = QVBoxLayout()
         row.setSpacing(self._sc(4))
         head = QHBoxLayout()
         head.setSpacing(self._sc(8))
-        glyph_lbl = self._label(glyph, 12, TXT_MID)
+        glyph_lbl = IconLabel(icon, self._sc(15), TXT_MID, fallback)
         name_lbl = self._label("", 11, TXT_MID)
         # имя занимает остаток ширины и обрезается с «…», не выдавливая процент
         name_lbl.setSizePolicy(QSizePolicy.Policy.Ignored,
@@ -1939,7 +2038,7 @@ class Widget(QWidget):
         row.addLayout(foot)
         return row, glyph_lbl, name_lbl, pct_lbl, bar, left_lbl
 
-    def _device_row_compact(self, glyph):
+    def _device_row_compact(self, icon, fallback=""):
         """Компактный ряд: иконка + имя + процент, без полоски.
 
         Остаток заряда выводится второй строкой: в узкой панели отдельная
@@ -1948,7 +2047,7 @@ class Widget(QWidget):
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(self._sc(5))
-        glyph_lbl = self._label(glyph, 10, TXT_MID)
+        glyph_lbl = IconLabel(icon, self._sc(13), TXT_MID, fallback)
         name_lbl = self._label("", 9, TXT_MID)
         name_lbl.setFixedWidth(self._sc(104))
         pct_lbl = self._label("", 9, TXT, QFont.Weight.Light)
@@ -2042,12 +2141,12 @@ class Widget(QWidget):
         self._apply_bt_names()      # ширина имён стала известна — обрезаем как надо
 
     def _build_full(self, root):
-        cpu_box, cpu_usage, cpu_bar, cpu_big = self._section("🧠 CPU")
+        cpu_box, cpu_usage, cpu_bar, cpu_big = self._section("cpu", "CPU")
         root.addLayout(cpu_box)
 
         root.addWidget(self._sep())
 
-        gpu_box, gpu_usage, gpu_bar, gpu_big = self._section("🖥 GPU")
+        gpu_box, gpu_usage, gpu_bar, gpu_big = self._section("gpu", "GPU")
         root.addLayout(gpu_box)
 
         self._bt_sep = self._sep()
@@ -2060,7 +2159,12 @@ class Widget(QWidget):
         bt_box = QVBoxLayout(bt_holder)
         bt_box.setContentsMargins(0, 0, 0, 0)
         bt_box.setSpacing(self._sc(8))
-        bt_box.addWidget(self._label("📶 БЕСПРОВОДНЫЕ", 10, TXT_DIM, spacing=1.8))
+        bt_head = QHBoxLayout()
+        bt_head.setSpacing(self._sc(5))
+        bt_head.addWidget(IconLabel("wireless", self._sc(14), TXT_DIM))
+        bt_head.addWidget(self._label("БЕСПРОВОДНЫЕ", 10, TXT_DIM, spacing=1.8))
+        bt_head.addStretch(1)
+        bt_box.addLayout(bt_head)
         self._bt_lay = QVBoxLayout()
         self._bt_lay.setSpacing(self._sc(8))
         bt_box.addLayout(self._bt_lay)
@@ -2077,9 +2181,10 @@ class Widget(QWidget):
     def _build_minimal(self, root):
         """Компактный режим: две строки цифр + список устройств без полос."""
         self.lbl = {}
-        for title, key in (("🧠 CPU", "cpu"), ("🖥 GPU", "gpu")):
+        for icon, title, key in (("cpu", "CPU", "cpu"), ("gpu", "GPU", "gpu")):
             row = QHBoxLayout()
             row.setSpacing(self._sc(6))
+            row.addWidget(IconLabel(icon, self._sc(12), TXT_DIM))
             row.addWidget(self._label(title, 9, TXT_DIM, spacing=1.4))
             row.addStretch(1)
             big = self._label("—", 17, TXT, QFont.Weight.Light)
@@ -2146,13 +2251,14 @@ class Widget(QWidget):
         for dev in rows:
             holder = QWidget()
             _no_mouse(holder)
-            glyph = device_glyph(dev["name"])
+            icon = dev.get("_icon") or device_icon(dev["name"])
+            fallback = device_glyph(dev["name"])
             if self.minimal:
                 lay, glyph_lbl, name_lbl, pct_lbl, bar, left_lbl = \
-                    self._device_row_compact(glyph)
+                    self._device_row_compact(icon, fallback)
             else:
                 lay, glyph_lbl, name_lbl, pct_lbl, bar, left_lbl = \
-                    self._device_row(glyph)
+                    self._device_row(icon, fallback)
             holder.setLayout(lay)
             self._bt_lay.addWidget(holder)
             self._bt_rows.append((glyph_lbl, name_lbl, pct_lbl, bar, left_lbl))
@@ -2209,6 +2315,13 @@ class Widget(QWidget):
                     and not (not x["online"] and hide))
         # офлайн-устройства — в конце списка (порядок остальных не меняется)
         rows.sort(key=lambda r: 0 if r["online"] else 1)
+        # слоты «наушники»/«мышь» задают иконку даже для нестандартных имён
+        for dev in rows:
+            dev["_icon"] = device_icon(dev["name"])
+        if hp:
+            hp["_icon"] = "headphones"
+        if ms:
+            ms["_icon"] = "mouse"
 
         sig = tuple((r["name"], r["online"]) for r in rows)
         changed = sig != self._bt_sig
@@ -2235,8 +2348,7 @@ class Widget(QWidget):
             self._track_battery(dev)
             name_lbl.setStyleSheet(
                 f"color: {TXT_MID if online else TXT_OFF}; background: transparent;")
-            glyph_lbl.setStyleSheet(
-                f"color: {TXT_MID if online else TXT_OFF}; background: transparent;")
+            glyph_lbl.set_color(TXT_MID if online else TXT_OFF)
             if online and level is not None:
                 pct_lbl.setText(f"{level} %")
                 warn_at = int(self.cfg.get("low_battery") or 0) or 20

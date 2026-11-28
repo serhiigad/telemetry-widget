@@ -15,3 +15,6 @@ env/
 screenshots/_raw/
 screenshots/_*.png
 screenshots/_*.json
+
+# превью набора иконок
+assets/icons/_preview.png
