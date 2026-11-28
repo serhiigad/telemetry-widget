@@ -2654,8 +2654,12 @@ class Widget(QWidget):
         except (TypeError, ValueError):
             low = 0.05
         low = max(0.0, min(1.0, low))
+        # в автоскрытии панель выезжает под курсор сама — таять не должна,
+        # иначе она «выехала и сразу стала прозрачной»
         active = (self._click_through and inside and not self._settings_open
                   and not self._hold.isActive() and not self._pin_guard
+                  and not self._auto_hidden
+                  and not bool(self.cfg.get("autohide_fullscreen"))
                   and bool(self.cfg.get("hover_fade", True)))
         self._animate_fade(low if active else 1.0)
 
