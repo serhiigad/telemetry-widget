@@ -108,6 +108,7 @@ DEFAULT_CONFIG = {
     "hover_card": True,      # всплывающая карточка устройства под курсором
     "autohide_fullscreen": False,   # автоскрытие в закладку у края экрана
     "autohide_mode": "game",        # game (только полноэкранные игры) / always
+    "autohide_delay": 8,            # сколько стоять без курсора перед скрытием, с
     "autohide_edge": "nearest",     # nearest / left / right — куда уезжать
     "check_updates": True,   # проверять обновления на GitHub
     "update_url": "https://raw.githubusercontent.com/serhiigad/"
@@ -267,6 +268,13 @@ def load_config():
         cfg["autohide_edge"] = "nearest"
     if str(cfg.get("autohide_mode") or "") not in ("game", "always"):
         cfg["autohide_mode"] = "game"
+    try:
+        delay = float(cfg.get("autohide_delay", 8))
+    except (TypeError, ValueError):
+        delay = 8.0
+    cfg["autohide_delay"] = int(max(1, min(60, delay)))
+    if not isinstance(cfg.get("tab_y"), int):
+        cfg.pop("tab_y", None)
     return cfg
 
 
@@ -1457,23 +1465,36 @@ class HoverCard(QWidget):
 
 
 class EdgeTab(QWidget):
-    """Закладка у края монитора, пока виджет спрятан на время игры.
+    """Закладка у края монитора, пока виджет спрятан (автоскрытие).
 
     Ширина всего 12 px и зажата в пределах своего монитора — на соседний
-    экран ничего не вылезает.
+    экран ничего не вылезает. Закладку можно перетащить вдоль края: её
+    положение запоминается, но на место выезда панели оно не влияет.
     """
 
-    def __init__(self, on_activate):
+    HOVER_MS = 700       # наведение → панель выезжает (клик — сразу)
+    DRAG_PX = 4          # сдвиг, после которого это уже перетаскивание
+
+    def __init__(self, on_activate, on_moved=None):
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         self._on_activate = on_activate
+        self._on_moved = on_moved
         self._side = "right"
         self._accent = QColor("#E31937")
+        self._press_global = None      # точка нажатия (None — кнопка не зажата)
+        self._press_y = 0
+        self._dragging = False
+        self._hover = QTimer(self)
+        self._hover.setSingleShot(True)
+        self._hover.setInterval(self.HOVER_MS)
+        self._hover.timeout.connect(self._fire)
         self.setFixedWidth(12)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("Наведите курсор — виджет выедет обратно")
+        self.setCursor(Qt.CursorShape.SizeVerCursor)
+        self.setToolTip("Наведение — виджет выедет\n"
+                        "Перетаскивание вдоль края — передвинуть закладку")
 
     def set_accent(self, color):
         self._accent = QColor(color)
@@ -1483,13 +1504,59 @@ class EdgeTab(QWidget):
         self._side = side if side in ("left", "right") else "right"
         self.update()
 
-    def enterEvent(self, _e):
+    def _fire(self):
         if self._on_activate:
             self._on_activate()
 
+    def _monitor_rect(self):
+        screen = QApplication.screenAt(self.frameGeometry().center())
+        if screen is None:
+            screen = self.screen() or QApplication.primaryScreen()
+        return screen.availableGeometry() if screen is not None else None
+
+    def enterEvent(self, _e):
+        if self._press_global is None:
+            self._hover.start()
+
+    def leaveEvent(self, _e):
+        self._hover.stop()
+
     def mousePressEvent(self, e):
-        if self._on_activate:
-            self._on_activate()
+        if e.button() != Qt.MouseButton.LeftButton:
+            e.ignore()
+            return
+        self._hover.stop()
+        self._press_global = e.globalPosition().toPoint()
+        self._press_y = self.y()
+        self._dragging = False
+        e.accept()
+
+    def mouseMoveEvent(self, e):
+        if self._press_global is None:
+            return
+        delta = e.globalPosition().toPoint() - self._press_global
+        if not self._dragging and delta.manhattanLength() < self.DRAG_PX:
+            return
+        self._dragging = True
+        y = self._press_y + delta.y()
+        g = self._monitor_rect()
+        if g is not None:
+            y = min(max(y, g.top()), max(g.top(), g.bottom() + 1 - self.height()))
+        self.move(self.x(), y)       # только вдоль края — x не меняется
+        e.accept()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton:
+            e.ignore()
+            return
+        self._press_global = None
+        was_drag = self._dragging
+        self._dragging = False
+        if was_drag:
+            if self._on_moved:
+                self._on_moved(self.y())
+        elif self._on_activate:
+            self._on_activate()      # одиночный клик = показать панель
         e.accept()
 
     def paintEvent(self, _event):
@@ -1633,6 +1700,16 @@ class Widget(QWidget):
         self._peek_timer = QTimer(self)
         self._peek_timer.setInterval(400)
         self._peek_timer.timeout.connect(self._peek_tick)
+        # задержка «постоять и уехать» + плавный выезд/заезд панели
+        self._dwell = QTimer(self)
+        self._dwell.setSingleShot(True)
+        self._dwell.timeout.connect(self._dwell_done)
+        self._slide_anim = QVariantAnimation(self)
+        self._slide_anim.setDuration(240)
+        self._slide_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._slide_anim.valueChanged.connect(self._on_slide)
+        self._slide_anim.finished.connect(self._slide_finished)
+        self._slide_done = None
 
         # обновления: сеть — в фоне, установка — при перезапуске
         self._update_thread = None
@@ -2023,17 +2100,62 @@ class Widget(QWidget):
             elif self._autohide_mode() == "game" and not self._fullscreen_here():
                 self._exit_autohide()
             return
-        if self._autohide_wanted():
+        if not self._autohide_wanted():
+            self._dwell.stop()
+            return
+        if self._autohide_mode() == "game":
+            self._enter_autohide()        # игра — убираем сразу
+            return
+        # «всегда»: панель сначала постоит без курсора, потом плавно уедет
+        if self._dwell.isActive() or self._sliding():
+            return
+        self._dwell.setInterval(int(self._dwell_sec() * 1000))
+        self._dwell.start()
+
+    # ------------------------------------------ плавный выезд и задержка
+
+    def _slide_to(self, target, on_done=None):
+        """Плавно переехать в точку; on_done — после окончания."""
+        self._slide_anim.stop()
+        self._slide_done = on_done
+        self._slide_anim.setStartValue(QPoint(self.x(), self.y()))
+        self._slide_anim.setEndValue(QPoint(target))
+        self._slide_anim.start()
+
+    def _on_slide(self, value):
+        self.move(value)
+
+    def _slide_finished(self):
+        done, self._slide_done = self._slide_done, None
+        if done:
+            done()
+
+    def _sliding(self):
+        return self._slide_anim.state() == QVariantAnimation.State.Running
+
+    def _dwell_sec(self):
+        try:
+            sec = float(self.cfg.get("autohide_delay", 8) or 8)
+        except (TypeError, ValueError):
+            sec = 8.0
+        return max(1.0, min(60.0, sec))
+
+    def _dwell_done(self):
+        """Панель постояла без курсора — плавно заехать за край."""
+        if self._auto_hidden:
+            if self._pointer_inside():
+                return
+            self._back_to_tab()
+        elif self._autohide_wanted():
             self._enter_autohide()
 
     def _enter_autohide(self):
-        """Спрятать панель, оставив закладку у ближайшего края своего монитора."""
-        if not self.isVisible():
+        """Спрятать панель, оставив закладку у края своего монитора."""
+        if not self.isVisible() or self._sliding():
             return
-        screen = self.screen() or QApplication.primaryScreen()
-        if screen is None:
+        g = self._monitor_geom()
+        if g is None:
             return
-        g = screen.availableGeometry()
         self._auto_hidden = True
         self._saved_geo = self.geometry()     # cfg["pos"] не перезаписываем
         edge = str(self.cfg.get("autohide_edge") or "nearest")
@@ -2042,20 +2164,26 @@ class Widget(QWidget):
             edge = "left" if center < g.left() + g.width() / 2.0 else "right"
         self._edge = edge
         self._hide_hover_card()
-        self.hide()
-        self._show_tab(g)
+        self._dwell.stop()
+        self._peek_timer.stop()
+        self._slide_anim.stop()
+        self._slide_to(QPoint(self._edge_x(g, False), self.y()),
+                       lambda: self._after_slide_hide(g))
         self._sync_tray()
         self._sync_mouse_hook()
 
     def _show_tab(self, g):
         tab = self._tab
         if tab is None:
-            tab = EdgeTab(self._peek)
+            tab = EdgeTab(self._peek, self._on_tab_moved)
             self._tab = tab
         tab.set_side(self._edge)
         tab.set_accent(self._accent_now)
         height = max(64, min(150, self._sc(96)))
-        if self._saved_geo is not None:
+        saved = self.cfg.get("tab_y")
+        if isinstance(saved, int):
+            y = saved                       # закладку двигали — помним где
+        elif self._saved_geo is not None:
             y = self._saved_geo.center().y() - height // 2
         else:
             y = g.top() + 120
@@ -2066,62 +2194,117 @@ class Widget(QWidget):
         tab.show()
         tab.raise_()
 
-    def _peek(self):
-        """Закладку навели или нажали — показать виджет у этого края."""
-        if not self._auto_hidden:
-            return
-        if self._tab is not None:
-            self._tab.hide()
-        screen = self.screen() or QApplication.primaryScreen()
+    def _on_tab_moved(self, y):
+        """Закладку перетащили вдоль края: запоминаем, панель выезжает как раньше."""
+        self.cfg["tab_y"] = int(y)
+        self._save_timer.start()
+
+    def _monitor_geom(self):
+        """Монитор панели — по сохранённой позиции, а не по текущей за краем."""
+        if self._saved_geo is not None:
+            point = self._saved_geo.center()
+        else:
+            point = self.frameGeometry().center()
+        screen = QApplication.screenAt(point) or self.screen()
         if screen is None:
-            return
-        g = screen.availableGeometry()
-        x = (g.left() if self._edge == "left"
-             else g.right() + 1 - self.width())
+            screen = QApplication.primaryScreen()
+        return screen.availableGeometry() if screen is not None else None
+
+    def _edge_x(self, g, shown=True):
+        """X панели: на месте (shown) или целиком за краем своего монитора."""
+        if self._edge == "left":
+            return g.left() if shown else g.left() - self.width()
+        return g.right() + 1 - self.width() if shown else g.right() + 1
+
+    def _panel_y(self, g):
+        """Y панели при выезде — по её сохранённой позиции, а не по закладке."""
         if self._saved_geo is not None:
             y = self._saved_geo.center().y() - self.height() // 2
         else:
             y = g.top() + 84
-        y = min(max(y, g.top()), max(g.top(), g.bottom() + 1 - self.height()))
-        self.move(x, y)
+        return min(max(y, g.top()), max(g.top(), g.bottom() + 1 - self.height()))
+
+    def _peek(self):
+        """Закладку навели или нажали — плавно выдвинуть панель из-за края."""
+        if not self._auto_hidden or self.isVisible():
+            return
+        g = self._monitor_geom()
+        if g is None:
+            return
+        if self._tab is not None:
+            self._tab.hide()
+        y = self._panel_y(g)
+        self._slide_anim.stop()
+        self.move(self._edge_x(g, False), y)   # старт за краем — без мигания
         self.show()
         self._apply_topmost()
+        self._slide_to(QPoint(self._edge_x(g, True), y))
         self._peek_timer.start()
 
     def _peek_tick(self):
-        """Мышь ушла с выглянувшей панели — вернуть закладку."""
+        """Мышь ушла с выглянувшей панели — отсчитать задержку и уехать."""
         if not self._auto_hidden or not self.isVisible():
             self._peek_timer.stop()
+            self._dwell.stop()
             return
         if self._settings_open or self._drag_offset is not None:
+            self._dwell.stop()
             return
         if self._hold.isActive():
+            self._dwell.stop()
             return
         if self._pointer_inside():
+            self._dwell.stop()           # вернулись на панель — отсчёт заново
             return
-        self._back_to_tab()
+        if self._dwell.isActive() or self._sliding():
+            return
+        self._dwell.setInterval(int(self._dwell_sec() * 1000))
+        self._dwell.start()
 
     def _back_to_tab(self):
+        """Плавно заехать за край и оставить закладку."""
         self._peek_timer.stop()
+        self._dwell.stop()
         if not self._auto_hidden:
             return
-        screen = self.screen() or QApplication.primaryScreen()
+        g = self._monitor_geom()
         self._hide_hover_card()
+        if not self.isVisible() or g is None:
+            self.hide()
+            if g is not None:
+                self._show_tab(g)
+            return
+        self._slide_to(QPoint(self._edge_x(g, False), self.y()),
+                       lambda: self._after_slide_hide(g))
+
+    def _after_slide_hide(self, g):
+        if not self._auto_hidden:
+            return
         self.hide()
-        if screen is not None:
-            self._show_tab(screen.availableGeometry())
+        self._show_tab(g)
 
     def _exit_autohide(self):
         """Игра закрылась — вернуть панель на сохранённое место."""
         self._auto_hidden = False
         self._peek_timer.stop()
+        self._dwell.stop()
         if self._tab is not None:
             self._tab.hide()
-        if self._saved_geo is not None:
-            self.move(self._saved_geo.topLeft())
-            self._saved_geo = None
-        self.show()
-        self._apply_topmost()
+        g = self._monitor_geom() if self._saved_geo is not None else None
+        target = self._saved_geo.topLeft() if self._saved_geo is not None else None
+        self._saved_geo = None
+        if target is not None and not self.isVisible() and g is not None:
+            self._slide_anim.stop()
+            self.move(self._edge_x(g, False), target.y())
+            self.show()
+            self._apply_topmost()
+            self._slide_to(target)       # игра кончилась — панель выезжает
+        else:
+            if target is not None:
+                self._slide_anim.stop()
+                self.move(target)
+            self.show()
+            self._apply_topmost()
         self._sync_tray()
         self._sync_mouse_hook()
 
@@ -3624,6 +3807,8 @@ class Widget(QWidget):
         self._history_timer.stop()
         self._full_timer.stop()
         self._peek_timer.stop()
+        self._dwell.stop()
+        self._slide_anim.stop()
         self._update_timer.stop()
         thread = self._update_thread
         if thread is not None and thread.isRunning():
@@ -4099,7 +4284,8 @@ class SettingsDialog(QDialog):
         form.addRow("Автоскрытие",
                     self._toggle_row(
                         self.autohide_sw,
-                        "у края монитора остаётся закладка, наведение возвращает панель"))
+                        "у края монитора — закладка (её можно перетащить), "
+                        "наведение возвращает панель"))
 
         self.autohide_cb = QComboBox()
         for key, title in (("game", "Только в полноэкранных играх"),
@@ -4112,6 +4298,16 @@ class SettingsDialog(QDialog):
             "«Всегда» — панель живёт закладкой у края и выезжает только\n"
             "под курсором или кликом по закладке.")
         form.addRow("Когда прятать", self.autohide_cb)
+
+        self.delay_sp = QSpinBox()
+        self.delay_sp.setRange(1, 60)
+        self.delay_sp.setSuffix(" с")
+        self.delay_sp.setValue(int(cfg.get("autohide_delay", 8) or 8))
+        self.delay_sp.setToolTip(
+            "Сколько держать панель после того, как убрали курсор.\n"
+            "Закладку можно перетащить вдоль края — панель всё равно\n"
+            "выезжает на своё место.")
+        form.addRow("Прятать через", self.delay_sp)
 
         self.edge_cb = QComboBox()
         for key, title in (("nearest", "Ближайшая сторона"),
@@ -4179,6 +4375,7 @@ class SettingsDialog(QDialog):
         self.hot_sp.setEnabled(self.hot_sw.isChecked())
         self.hover_sp.setEnabled(self.hover_sw.isChecked())
         self.autohide_cb.setEnabled(self.autohide_sw.isChecked())
+        self.delay_sp.setEnabled(self.autohide_sw.isChecked())
         self.edge_cb.setEnabled(self.autohide_sw.isChecked())
 
         bottom = QHBoxLayout()
@@ -4209,6 +4406,7 @@ class SettingsDialog(QDialog):
         self.card_sw.toggled.connect(self._emit_change)
         self.autohide_sw.toggled.connect(self._autohide_toggled)
         self.autohide_cb.currentIndexChanged.connect(self._emit_change)
+        self.delay_sp.valueChanged.connect(self._emit_change)
         self.edge_cb.currentIndexChanged.connect(self._emit_change)
         self.update_sw.toggled.connect(self._emit_change)
         self.scale_sp.valueChanged.connect(self._emit_change)
@@ -4562,6 +4760,7 @@ class SettingsDialog(QDialog):
         """Выключенное автоскрытие — выбор режима и стороны неактуален."""
         enabled = self.autohide_sw.isChecked()
         self.autohide_cb.setEnabled(enabled)
+        self.delay_sp.setEnabled(enabled)
         self.edge_cb.setEnabled(enabled)
         self._emit_change()
 
@@ -4606,6 +4805,7 @@ class SettingsDialog(QDialog):
             "hover_card": self.card_sw.isChecked(),
             "autohide_fullscreen": self.autohide_sw.isChecked(),
             "autohide_mode": self.autohide_cb.currentData() or "game",
+            "autohide_delay": self.delay_sp.value(),
             "autohide_edge": self.edge_cb.currentData(),
             "check_updates": self.update_sw.isChecked(),
             "font": self.font_cb.currentFont().family(),
