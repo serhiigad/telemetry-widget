@@ -1475,6 +1475,7 @@ class EdgeTab(QWidget):
 
     HOVER_MS = 700       # наведение → панель выезжает (клик — сразу)
     DRAG_PX = 4          # сдвиг, после которого это уже перетаскивание
+    HANDLE_H = 16        # верхняя полоска: только перетаскивание
 
     def __init__(self, on_activate, on_moved=None):
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint)
@@ -1487,15 +1488,17 @@ class EdgeTab(QWidget):
         self._accent = QColor("#E31937")
         self._press_global = None      # точка нажатия (None — кнопка не зажата)
         self._press_y = 0
+        self._drag_mode = False        # нажали за полоску-ручку наверху
         self._dragging = False
         self._hover = QTimer(self)
         self._hover.setSingleShot(True)
         self._hover.setInterval(self.HOVER_MS)
         self._hover.timeout.connect(self._fire)
         self.setFixedWidth(12)
-        self.setCursor(Qt.CursorShape.SizeVerCursor)
-        self.setToolTip("Наведение — виджет выедет\n"
-                        "Перетаскивание вдоль края — передвинуть закладку")
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Наведение или клик — виджет выедет\n"
+                        "Полоска сверху — потянуть, чтобы передвинуть закладку")
 
     def set_accent(self, color):
         self._accent = QColor(color)
@@ -1515,9 +1518,27 @@ class EdgeTab(QWidget):
             screen = self.screen() or QApplication.primaryScreen()
         return screen.availableGeometry() if screen is not None else None
 
-    def enterEvent(self, _e):
+    def _in_handle(self, pos):
+        return pos.y() < self.HANDLE_H
+
+    def _update_cursor(self, pos):
+        self.setCursor(Qt.CursorShape.SizeVerCursor if self._in_handle(pos)
+                       else Qt.CursorShape.PointingHandCursor)
+
+    def _drop_stale_press(self):
+        """Отпускание могло потеряться (закладка спряталась под курсором)."""
+        if (self._press_global is not None
+                and not (QApplication.mouseButtons()
+                         & Qt.MouseButton.LeftButton)):
+            self._press_global = None
+            self._drag_mode = False
+            self._dragging = False
+
+    def enterEvent(self, e):
+        self._drop_stale_press()
         if self._press_global is None:
             self._hover.start()
+        self._update_cursor(e.position().toPoint())
 
     def leaveEvent(self, _e):
         self._hover.stop()
@@ -1529,11 +1550,16 @@ class EdgeTab(QWidget):
         self._hover.stop()
         self._press_global = e.globalPosition().toPoint()
         self._press_y = self.y()
+        self._drag_mode = self._in_handle(e.position().toPoint())
         self._dragging = False
         e.accept()
 
     def mouseMoveEvent(self, e):
         if self._press_global is None:
+            self._update_cursor(e.position().toPoint())
+            return
+        if not self._drag_mode:
+            e.accept()
             return
         delta = e.globalPosition().toPoint() - self._press_global
         if not self._dragging and delta.manhattanLength() < self.DRAG_PX:
@@ -1551,6 +1577,7 @@ class EdgeTab(QWidget):
             e.ignore()
             return
         self._press_global = None
+        self._drag_mode = False
         was_drag = self._dragging
         self._dragging = False
         if was_drag:
@@ -1569,11 +1596,15 @@ class EdgeTab(QWidget):
         p.drawRoundedRect(QRectF(0, 0, w, h), 6, 6)
         p.setBrush(QColor(*BORDER_RGB, 60))
         p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), 6, 6)
+        # ручка сверху: за неё закладку перетаскивают, остальное — открывает
+        p.setBrush(QColor(*BORDER_RGB, 110))
+        p.drawRoundedRect(QRectF(w * 0.22, 4.0, w * 0.56, 1.6), 0.8, 0.8)
+        p.drawRoundedRect(QRectF(w * 0.22, 8.0, w * 0.56, 1.6), 0.8, 0.8)
         bar = QColor(self._accent)
         p.setBrush(bar)
-        pad = 5.0
-        p.drawRoundedRect(QRectF(w * 0.34, pad, max(2.0, w * 0.32), h - pad * 2),
-                          2, 2)
+        top = float(self.HANDLE_H)
+        p.drawRoundedRect(QRectF(w * 0.34, top, max(2.0, w * 0.32),
+                                 max(2.0, h - top - 6.0)), 2, 2)
 
 
 # ------------------------------------------------------------------- Виджет
