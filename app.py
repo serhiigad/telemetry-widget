@@ -1035,8 +1035,7 @@ class Sparkline(QWidget):
         self._fill = True
         self.setMinimumHeight(34)
         self.setSizePolicy(QSizePolicy.Policy.Expanding,
-                           QSizePolicy.Policy.Fixed)
-        self.setFixedHeight(34)
+                           QSizePolicy.Policy.Expanding)
 
     def set_points(self, points):
         self._points = list(points or [])
@@ -1166,7 +1165,10 @@ class HistoryDialog(QDialog):
         self.setWindowTitle("История заряда")
         self.setWindowFlags(Qt.Dialog | Qt.WindowStaysOnTopHint)
         self.setMinimumWidth(470)
+        self.setMinimumHeight(380)
         self.setStyleSheet(DIALOG_QSS)
+        self._user_size = None            # размер запоминаем, если его меняли
+        self._restore_size(widget)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 16, 18, 14)
@@ -1203,7 +1205,6 @@ class HistoryDialog(QDialog):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setMinimumHeight(150)
-        scroll.setMaximumHeight(580)
         scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }"
                              "QScrollArea > QWidget > QWidget "
                              "{ background: transparent; }")
@@ -1322,7 +1323,7 @@ class HistoryDialog(QDialog):
             if points:
                 line = Sparkline(self._accent)
                 line.set_points(points)
-                lay.addWidget(line)
+                lay.addWidget(line, 1)      # график тянется вместе с окном
                 # прогноз: сколько ещё протянёт в каждой точке истории
                 forecast = _forecast_series(points)
                 if len(forecast) >= 2:
@@ -1351,8 +1352,40 @@ class HistoryDialog(QDialog):
                     chart = DayRates(self._accent)
                     chart.set_rates(rates)
                     lay.addWidget(chart)
-            self._rows.addWidget(holder)
-        self.adjustSize()
+            self._rows.addWidget(holder, 1)
+        if self._user_size is None:
+            self.adjustSize()
+
+    def _restore_size(self, widget):
+        """Вспомнить размер окна (и не дать ему вылезти за монитор)."""
+        size = widget.cfg.get("history_size")
+        if not isinstance(size, (list, tuple)) or len(size) != 2:
+            return
+        try:
+            w, h = int(size[0]), int(size[1])
+        except (TypeError, ValueError):
+            return
+        if w < 470 or h < 380:
+            return
+        scr = widget.screen() or QApplication.primaryScreen()
+        avail = scr.availableGeometry() if scr is not None else None
+        if avail is not None:
+            w = min(w, max(470, avail.width() - 40))
+            h = min(h, max(380, avail.height() - 40))
+        self.resize(w, h)
+        self._user_size = self.size()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self.isVisible():
+            self._user_size = self.size()
+
+    def closeEvent(self, e):
+        if self._user_size is not None:
+            self.widget_ref.cfg["history_size"] = [self._user_size.width(),
+                                                   self._user_size.height()]
+            save_config(self.widget_ref.cfg)
+        super().closeEvent(e)
 
     def _clear(self):
         self.widget_ref.history.clear()
